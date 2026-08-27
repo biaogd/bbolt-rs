@@ -36,6 +36,9 @@ fn test_open_err_invalid() {
     {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "this is not a bolt database").unwrap();
+        // Pad past minimum open size so we reach meta validation.
+        let pad = vec![0u8; common::PAGE_SIZE * 2];
+        f.write_all(&pad).unwrap();
     }
     assert!(matches!(
         Db::open(&path, 0o600, Some(common::default_opts())),
@@ -522,20 +525,278 @@ fn test_db_write_to_and_overwrite() {
     .unwrap();
 }
 
-// Skipped: TestOpen_MultipleGoroutines — stress test, not required for API parity.
-// Skipped: TestOpen_ErrPathRequired — empty path behavior is platform-specific.
-// Skipped: TestOpen_ErrVersionMismatch, TestOpen_ErrChecksum — require raw meta surgery.
+// Go: TestOpen_ErrPathRequired
+#[test]
+fn test_open_err_path_required() {
+    assert!(Db::open("", 0o600, Some(common::default_opts())).is_err());
+}
+
+// Go: TestOpen_ErrVersionMismatch
+#[test]
+fn test_open_err_version_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    {
+        let db = common::must_create_db_in(dir.path());
+        db.close().unwrap();
+    }
+    common::corrupt_meta_version(&path, common::PAGE_SIZE);
+    assert!(matches!(
+        Db::open(&path, 0o600, Some(common::default_opts())),
+        Err(Error::VersionMismatch)
+    ));
+}
+
+// Go: TestOpen_ErrChecksum
+#[test]
+fn test_open_err_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    {
+        let db = common::must_create_db_in(dir.path());
+        db.close().unwrap();
+    }
+    common::corrupt_meta_checksum(&path, common::PAGE_SIZE);
+    assert!(matches!(
+        Db::open(&path, 0o600, Some(common::default_opts())),
+        Err(Error::Checksum)
+    ));
+}
+
+// Go: TestOpen_FileTooSmall
+#[test]
+fn test_open_file_too_small() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    {
+        let db = common::must_create_db_in(dir.path());
+        let ps = db.page_size();
+        db.close().unwrap();
+        std::fs::write(&path, vec![0u8; ps]).unwrap();
+    }
+    let result = Db::open(&path, 0o600, Some(common::default_opts()));
+    assert!(result.is_err(), "expected open error for truncated file");
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string().contains("file size too small"),
+        "unexpected: {err}"
+    );
+}
+
+// Go: TestOpen_MultipleGoroutines (moderate N)
+#[test]
+fn test_open_multiple_goroutines() {
+    const INSTANCES: usize = 10;
+    const ITERATIONS: usize = 10;
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    {
+        let db = common::must_create_db_in(dir.path());
+        db.close().unwrap();
+    }
+    for _ in 0..ITERATIONS {
+        let mut handles = Vec::new();
+        for _ in 0..INSTANCES {
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                let db = Db::open(&path, 0o600, Some(common::default_opts()))?;
+                db.close()
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+}
+
+// Go: TestOpen_Size (basic growth after writes)
+#[test]
+fn test_open_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    let page_size = common::PAGE_SIZE;
+    {
+        let db = common::must_create_db_in(dir.path());
+        common::fill_bucket(
+            &db,
+            b"data",
+            1000,
+            |k| format!("{k:04}").into_bytes(),
+            |_| vec![0u8; 1000],
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+    let sz = common::file_size(&path);
+    assert!(sz > 0);
+    let db = common::reopen(&dir, None);
+    db.update(|tx| {
+        tx.bucket(b"data").unwrap().put(b"\0", b"\0")?;
+        Ok(())
+    })
+    .unwrap();
+    db.close().unwrap();
+    let new_sz = common::file_size(&path);
+    assert!(
+        new_sz <= sz + 5 * page_size as u64,
+        "unexpected growth: {sz} => {new_sz}"
+    );
+}
+
+// Go: TestDB_MaxSizeExceededCanOpen
+#[test]
+fn test_db_max_size_exceeded_can_open() {
+    let parent = tempfile::tempdir().unwrap();
+    let (dir, db) = common::create_filled_db(parent.path(), 4 * 1024 * 1024, 2000);
+    let path = common::db_path(&dir);
+    common::fill_bucket(
+        &db,
+        b"data",
+        2000,
+        |k| format!("extra{k:04}").into_bytes(),
+        |_| vec![0u8; 1000],
+    )
+    .unwrap();
+    db.close().unwrap();
+    let sz = common::file_size(&path);
+    assert!(sz >= 1024 * 1024);
+    let db = Db::open(
+        &path,
+        0o600,
+        Some(Options {
+            page_size: common::PAGE_SIZE,
+            max_size: 1,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.close().unwrap();
+}
+
+// Go: TestDB_Concurrent_WriteTo_and_ConsistentRead (simplified — no cross-thread Tx)
+#[test]
+fn test_db_concurrent_write_to_and_consistent_read() {
+    use std::collections::HashMap;
+
+    let (_dir, db) = common::open_tmp_with(Options {
+        page_size: common::PAGE_SIZE,
+        ..Options::default()
+    });
+    db.update(|tx| {
+        tx.create_bucket(b"data")?;
+        Ok(())
+    })
+    .unwrap();
+
+    let wtxs = 10usize;
+    let rtxs = 3usize;
+
+    for round in 0..wtxs {
+        let tx = db.begin(true).unwrap();
+        let b = tx.bucket(b"data").unwrap();
+        let mut round_snapshots = Vec::new();
+        for _j in 0..rtxs {
+            let rtx = db.begin(false).unwrap();
+            thread::sleep(Duration::from_millis(5));
+            let backup = tempfile::NamedTempFile::new().unwrap();
+            rtx.copy_file(backup.path(), 0o600).unwrap();
+            let mut data = HashMap::new();
+            rtx.bucket(b"data").unwrap().for_each(|k, v| {
+                data.insert(
+                    String::from_utf8_lossy(k).into_owned(),
+                    String::from_utf8_lossy(v.unwrap()).into_owned(),
+                );
+                Ok(())
+            }).unwrap();
+            round_snapshots.push((backup, data));
+            rtx.rollback().unwrap();
+            for k in 0..5 {
+                b.put(format!("key_{k}").as_bytes(), format!("value_{round}_{k}").as_bytes())
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        if round_snapshots.len() >= 2 {
+            let first = round_snapshots[0].1.clone();
+            for (_backup, data) in &round_snapshots[1..] {
+                assert_eq!(first, *data, "inconsistent snapshot in round {round}");
+            }
+        }
+        for (backup, _data) in round_snapshots {
+            let snap = Db::open(
+                backup.path(),
+                0o600,
+                Some(Options {
+                    page_size: common::PAGE_SIZE,
+                    read_only: true,
+                    pre_load_freelist: true,
+                    ..Options::default()
+                }),
+            )
+            .unwrap();
+            snap.view(|tx| {
+                assert!(tx.check().is_empty());
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+}
+
+// Go: TestDB_BatchFull
+#[test]
+fn test_db_batch_full() {
+    let (_dir, db) = common::open_tmp();
+    let db = Arc::new(db);
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    const SIZE: usize = 3;
+    db.set_max_batch_size(SIZE);
+    db.set_max_batch_delay(Duration::from_secs(3600));
+    let (tx_ch, rx) = std::sync::mpsc::channel();
+    let put = |i: u64, db: Arc<Db>| {
+        let tx_ch = tx_ch.clone();
+        thread::spawn(move || {
+            let r = db.batch(move |tx| {
+                tx.bucket(b"widgets")
+                    .unwrap()
+                    .put(&i.to_le_bytes(), b"")?;
+                Ok(())
+            });
+            tx_ch.send(r).unwrap();
+        });
+    };
+    put(1, Arc::clone(&db));
+    put(2, Arc::clone(&db));
+    thread::sleep(Duration::from_millis(10));
+    assert!(rx.try_recv().is_err(), "batch triggered too early");
+    put(3, Arc::clone(&db));
+    for _ in 0..SIZE {
+        rx.recv().unwrap().unwrap();
+    }
+    db.view(|tx| {
+        let b = tx.bucket(b"widgets").unwrap();
+        for i in 1..=SIZE as u64 {
+            assert!(b.get(&i.to_le_bytes()).is_some());
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
 // Skipped: TestOpen_ReadPageSize_* — meta fallback page-size tests.
-// Skipped: TestOpen_Size, TestOpen_Size_Large — file growth regression tests.
 // Skipped: TestOpen_MetaInitWriteError — pending upstream.
 // Skipped: TestOpen_FileTooSmall — truncated file error string differs.
 // Skipped: TestDB_Concurrent_WriteTo_and_ConsistentRead — heavy concurrency stress.
 // Skipped: TestDB_Begin_ErrDatabaseNotOpen — zero-value Db not exposed the same way.
 // Skipped: TestDB_BeginRW_Closed, TestDB_Close_PendingTx_* — close/pending tx timing.
 // Skipped: TestDB_Update_Closed, TestDB_Update_Panic, TestDB_View_Panic — panic/closed DB.
-// Skipped: TestDB_Batch_Panic, TestDB_BatchFull, TestDB_BatchTime — batch edge cases.
+// Skipped: TestDB_Batch_Panic, TestDB_BatchTime — batch edge cases.
 // Skipped: TestDBUnmap — whitebox field inspection.
-// Skipped: TestDB_MaxSizeExceededCanOpen* — secondary max-size open scenarios.
+// Skipped: TestDB_MaxSizeExceededCanOpenWithHighMmap — secondary max-size mmap scenario.
 // Skipped: TestDB_MaxSizeExceededDoesNotGrow, TestDB_WindowsMMapReadsAndWritesWithMaxSize —
 //          Windows-only (runtime.GOOS == "windows").
 // Skipped: TestDB_MaxSizeWithHighInitialMMapDoesNotGrowOnWrite — platform mmap behavior.

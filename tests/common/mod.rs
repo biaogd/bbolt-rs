@@ -86,3 +86,51 @@ pub fn assert_err<T: std::fmt::Debug>(result: Result<T>, expected: Error) {
         Ok(v) => panic!("expected error {expected}, got Ok({v:?})"),
     }
 }
+
+/// Corrupt both meta pages' version field without fixing checksums.
+pub fn corrupt_meta_version(path: &Path, page_size: usize) {
+    use bbolt::{meta_from_page, PAGE_HEADER_SIZE};
+    let mut buf = std::fs::read(path).unwrap();
+    for i in 0..2u64 {
+        let off = i as usize * page_size + PAGE_HEADER_SIZE;
+        let mut meta = meta_from_page(&buf[off..]);
+        meta.version += 1;
+        let ver_off = off + 4;
+        buf[ver_off..ver_off + 4].copy_from_slice(&meta.version.to_le_bytes());
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Corrupt both meta checksums by bumping pgid without recalculating (upstream `TestOpen_ErrChecksum`).
+pub fn corrupt_meta_checksum(path: &Path, page_size: usize) {
+    use bbolt::{meta_from_page, PAGE_HEADER_SIZE};
+    let mut buf = std::fs::read(path).unwrap();
+    for i in 0..2u64 {
+        let off = i as usize * page_size + PAGE_HEADER_SIZE;
+        let mut meta = meta_from_page(&buf[off..]);
+        meta.pgid += 1;
+        let meta_off = off + 40;
+        buf[meta_off..meta_off + 8].copy_from_slice(&meta.pgid.to_le_bytes());
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+/// Create a filled DB for max-size open tests.
+pub fn create_filled_db(
+    dir: &Path,
+    alloc_size: usize,
+    num_keys: i32,
+) -> (tempfile::TempDir, Db) {
+    let td = tempfile::tempdir_in(dir).unwrap();
+    let db = must_create_db_in(td.path());
+    db.set_alloc_size(alloc_size);
+    fill_bucket(
+        &db,
+        b"data",
+        num_keys,
+        |k| format!("{k:04}").into_bytes(),
+        |_| vec![0u8; 1000],
+    )
+    .unwrap();
+    (td, db)
+}

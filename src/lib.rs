@@ -22,6 +22,7 @@
 
 mod batch;
 mod bucket;
+mod bucket_stats;
 mod check;
 mod compact;
 mod cursor;
@@ -43,8 +44,9 @@ pub use error::{Error, Result};
 pub use freelist::FreelistType;
 pub use page::{DEFAULT_FILL_PERCENT, MAGIC, MAX_KEY_SIZE, MAX_VALUE_SIZE, VERSION};
 pub use page::{
-    branch_at, leaf_at, read_inodes, write_inodes, Inode, PageHeader, Pgid, Txid,
-    BRANCH_PAGE_FLAG, LEAF_PAGE_ELEMENT_SIZE, LEAF_PAGE_FLAG, PAGE_HEADER_SIZE,
+    branch_at, leaf_at, meta_from_page, read_inodes, write_inodes, write_meta_page, Inode,
+    Meta, PageHeader, Pgid, Txid, BRANCH_PAGE_FLAG, LEAF_PAGE_ELEMENT_SIZE, LEAF_PAGE_FLAG,
+    PAGE_HEADER_SIZE,
 };
-pub use stats::{BucketStructure, Info, PageInfo, Stats, TxStats};
+pub use stats::{BucketStats, BucketStructure, Info, PageInfo, Stats, TxStats};
 pub use tx::Tx;

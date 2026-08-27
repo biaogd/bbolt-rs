@@ -79,6 +79,44 @@ pub struct BucketStructure {
     pub children: Vec<BucketStructure>,
 }
 
+/// Per-bucket page statistics (upstream `BucketStats`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BucketStats {
+    pub branch_page_n: usize,
+    pub branch_overflow_n: usize,
+    pub leaf_page_n: usize,
+    pub leaf_overflow_n: usize,
+    pub key_n: usize,
+    pub depth: usize,
+    pub branch_alloc: usize,
+    pub branch_inuse: usize,
+    pub leaf_alloc: usize,
+    pub leaf_inuse: usize,
+    pub bucket_n: usize,
+    pub inline_bucket_n: usize,
+    pub inline_bucket_inuse: usize,
+}
+
+impl BucketStats {
+    pub fn add(&mut self, other: &BucketStats) {
+        self.branch_page_n += other.branch_page_n;
+        self.branch_overflow_n += other.branch_overflow_n;
+        self.leaf_page_n += other.leaf_page_n;
+        self.leaf_overflow_n += other.leaf_overflow_n;
+        self.key_n += other.key_n;
+        if other.depth > self.depth {
+            self.depth = other.depth;
+        }
+        self.branch_alloc += other.branch_alloc;
+        self.branch_inuse += other.branch_inuse;
+        self.leaf_alloc += other.leaf_alloc;
+        self.leaf_inuse += other.leaf_inuse;
+        self.bucket_n += other.bucket_n;
+        self.inline_bucket_n += other.inline_bucket_n;
+        self.inline_bucket_inuse += other.inline_bucket_inuse;
+    }
+}
+
 /// Lightweight page listing entry for CLI / debugging.
 #[derive(Clone, Debug)]
 pub struct PageInfo {

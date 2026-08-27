@@ -4,6 +4,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use std::sync::atomic::Ordering;
+
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::tx::Tx;
@@ -25,7 +27,7 @@ pub fn batch<F>(db: &Db, f: F) -> Result<()>
 where
     F: Fn(&Tx) -> Result<()> + Send + 'static,
 {
-    if db.inner.max_batch_size <= 1 {
+    if db.inner.max_batch_size.load(Ordering::Relaxed) <= 1 {
         return db.update(|tx| f(tx));
     }
 
@@ -37,13 +39,16 @@ where
             f: Box::new(f),
             ret: tx_ch,
         });
-        run_now = st.calls.len() >= db.inner.max_batch_size;
+        run_now = st.calls.len() >= db.inner.max_batch_size.load(Ordering::Relaxed);
         if run_now {
             st.scheduled = false;
         } else if !st.scheduled {
             st.scheduled = true;
             let db2 = db.clone();
-            let delay = db.inner.max_batch_delay.max(Duration::from_millis(1));
+            let delay = {
+                let d = *db.inner.max_batch_delay.lock();
+                d.max(Duration::from_millis(1))
+            };
             thread::spawn(move || {
                 thread::sleep(delay);
                 drain_and_run(&db2);

@@ -342,9 +342,55 @@ fn test_tx_on_commit_rollback() {
     assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
 }
 
-// Skipped: TestTx_CreateBucket_ErrTxClosed, TestTx_DeleteBucket_ErrTxClosed — stale tx handle.
-// Skipped: TestTx_Get_NotFound — bucket-level get covered in bucket tests.
+// Go: TestTx_Get_NotFound
+#[test]
+fn test_tx_get_not_found() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.put(b"foo", b"bar")?;
+        assert!(b.get(b"no_such_key").is_none());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestTx_CreateBucket_ErrTxClosed
+#[test]
+fn test_tx_create_bucket_err_tx_closed() {
+    let (_dir, db) = common::open_tmp();
+    let tx = db.begin(true).unwrap();
+    tx.commit().unwrap();
+    assert!(matches!(
+        tx.create_bucket(b"foo"),
+        Err(Error::TxClosed)
+    ));
+}
+
+// Go: TestTx_DeleteBucket_ErrTxClosed
+#[test]
+fn test_tx_delete_bucket_err_tx_closed() {
+    let (_dir, db) = common::open_tmp();
+    let tx = db.begin(true).unwrap();
+    tx.commit().unwrap();
+    assert!(matches!(tx.delete_bucket(b"foo"), Err(Error::TxClosed)));
+}
+
+// Go: TestTxStats_Sub
+#[test]
+fn test_tx_stats_sub() {
+    let mut a = bbolt::TxStats::default();
+    let mut b = bbolt::TxStats::default();
+    a.page_count = 3;
+    a.split = 1;
+    b.page_count = 10;
+    b.split = 4;
+    let diff = b.sub(&a);
+    assert_eq!(diff.page_count, 7);
+    assert_eq!(diff.split, 3);
+}
+
 // Skipped: TestTx_CopyFile_Error_Meta, TestTx_CopyFile_Error_Normal — failWriter injection.
 // Skipped: TestTx_releaseRange — complex freelist releaseRange integration test.
-// Skipped: TestTxStats_GetAndIncAtomically, TestTxStats_Sub — TxStats counters not instrumented.
+// Skipped: TestTxStats_GetAndIncAtomically — TxStats counters not instrumented.
 // Skipped: TestTx_TruncateBeforeWrite — Unix-specific grow/truncate behavior.

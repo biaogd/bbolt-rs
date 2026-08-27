@@ -205,8 +205,147 @@ fn test_cursor_first_last_basics() {
     .unwrap();
 }
 
+// Go: TestCursor_Seek_Large (thousands of keys)
+#[test]
+fn test_cursor_seek_large() {
+    let (_dir, db) = common::open_tmp();
+    const COUNT: u64 = 3000;
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        for block in (0..COUNT).step_by(100) {
+            for j in block..block + 100 {
+                if j % 2 == 0 {
+                    b.put(&j.to_be_bytes(), &[0u8; 100])?;
+                }
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        for i in 0..COUNT {
+            let seek = i.to_be_bytes();
+            let (k, _) = c.seek(&seek).unwrap();
+            if i == COUNT - 1 {
+                assert!(k.is_none());
+                continue;
+            }
+            let num = u64::from_be_bytes(k.unwrap().try_into().unwrap());
+            if i % 2 == 0 {
+                assert_eq!(num, i, "even seek at {i}");
+            } else {
+                assert_eq!(num, i + 1, "odd seek at {i}");
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestCursor_LeafRootReverse
+#[test]
+fn test_cursor_leaf_root_reverse() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.put(b"baz", b"")?;
+        b.put(b"foo", &[0])?;
+        b.put(b"bar", &[1])?;
+        Ok(())
+    })
+    .unwrap();
+    let tx = db.begin(false).unwrap();
+    let mut c = tx.bucket(b"widgets").unwrap().cursor();
+    let (k, v) = c.last().unwrap();
+    assert_eq!(k.as_deref(), Some(&b"foo"[..]));
+    assert_eq!(v.as_deref(), Some(&[0][..]));
+    let (k, v) = c.prev().unwrap();
+    assert_eq!(k.as_deref(), Some(&b"baz"[..]));
+    assert_eq!(v.as_deref(), Some(&b""[..]));
+    let (k, v) = c.prev().unwrap();
+    assert_eq!(k.as_deref(), Some(&b"bar"[..]));
+    assert_eq!(v.as_deref(), Some(&[1][..]));
+    let (k, v) = c.prev().unwrap();
+    assert!(k.is_none());
+    assert!(v.is_none());
+    tx.rollback().unwrap();
+}
+
+// Go: TestCursor_First_EmptyPages
+#[test]
+fn test_cursor_first_empty_pages() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        for i in 0..1000u64 {
+            b.put(&i.to_be_bytes(), b"")?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.update(|tx| {
+        let b = tx.bucket(b"widgets").unwrap();
+        for i in 0..600u64 {
+            b.delete(&i.to_be_bytes())?;
+        }
+        let mut c = b.cursor();
+        let mut n = 0;
+        let mut kv = c.first().unwrap();
+        while kv.0.is_some() {
+            n += 1;
+            kv = c.next().unwrap();
+        }
+        assert_eq!(n, 400);
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestCursor_Last_EmptyPages
+#[test]
+fn test_cursor_last_empty_pages() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        for i in 0..1000u64 {
+            b.put(&i.to_be_bytes(), b"")?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.update(|tx| {
+        let b = tx.bucket(b"widgets").unwrap();
+        for i in 200..1000u64 {
+            b.delete(&i.to_be_bytes())?;
+        }
+        let mut c = b.cursor();
+        let mut n = 0;
+        let mut kv = c.last().unwrap();
+        while kv.0.is_some() {
+            n += 1;
+            kv = c.prev().unwrap();
+        }
+        assert_eq!(n, 200);
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestCursor_Bucket
+#[test]
+fn test_cursor_bucket() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.put(b"a", b"1")?;
+        let c = b.cursor();
+        let cb = c.bucket();
+        assert_eq!(cb.get(b"a").as_deref(), Some(&b"1"[..]));
+        Ok(())
+    })
+    .unwrap();
+}
+
 // Skipped: TestCursor_RepeatOperations — full 1000-key repeat next/prev cycle.
-// Skipped: TestCursor_Bucket — cursor.bucket() identity (no Go-style pointer equality).
-// Skipped: TestCursor_Seek_Large — 10000-key seek regression (covered partially above).
-// Skipped: TestCursor_LeafRootReverse, First/Last_EmptyPages — extended cursor edge cases.
 // Skipped: TestCursor_QuickCheck* — property/quick tests.

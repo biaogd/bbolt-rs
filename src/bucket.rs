@@ -124,6 +124,12 @@ impl Bucket {
         Ok(())
     }
 
+    /// Page and key statistics for this bucket (upstream `Bucket.Stats`).
+    pub fn stats(&self) -> crate::stats::BucketStats {
+        let inner = self.tx.borrow();
+        crate::bucket_stats::bucket_stats(&inner, self.id)
+    }
+
     pub fn move_bucket(&self, key: &[u8], dst: &Bucket) -> Result<()> {
         if !self.same_db(dst) {
             return Err(crate::error::Error::DifferentDb);

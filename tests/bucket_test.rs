@@ -474,14 +474,326 @@ fn test_bucket_inspect() {
     .unwrap();
 }
 
+// Go: TestBucket_Get_IncompatibleValue
+#[test]
+fn test_bucket_get_incompatible_value() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.create_bucket(b"foo")?;
+        assert!(b.get(b"foo").is_none());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Delete_ReadOnly
+#[test]
+fn test_bucket_delete_read_only() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        assert!(matches!(
+            tx.bucket(b"widgets").unwrap().delete(b"foo"),
+            Err(Error::TxNotWritable)
+        ));
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_ForEachBucket_NoBuckets
+#[test]
+fn test_bucket_for_each_bucket_no_buckets() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.put(b"foo", b"0000")?;
+        b.put(b"baz", b"0001")?;
+        let mut names = Vec::new();
+        b.for_each_bucket(|name| {
+            names.push(name.to_vec());
+            Ok(())
+        })?;
+        assert!(names.is_empty());
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let b = tx.bucket(b"widgets").unwrap();
+        let mut names = Vec::new();
+        b.for_each_bucket(|name| {
+            names.push(name.to_vec());
+            Ok(())
+        })?;
+        assert!(names.is_empty());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Bucket_IncompatibleValue
+#[test]
+fn test_bucket_bucket_incompatible_value() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let widgets = tx.create_bucket(b"widgets")?;
+        widgets.put(b"foo", b"bar")?;
+        assert!(widgets.bucket(b"foo").is_none());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_CreateBucket_IncompatibleValue
+#[test]
+fn test_bucket_create_bucket_incompatible_value() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let widgets = tx.create_bucket(b"widgets")?;
+        widgets.put(b"foo", b"bar")?;
+        assert!(matches!(
+            widgets.create_bucket(b"foo"),
+            Err(Error::IncompatibleValue)
+        ));
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_DeleteBucket_IncompatibleValue
+#[test]
+fn test_bucket_delete_bucket_incompatible_value() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let widgets = tx.create_bucket(b"widgets")?;
+        widgets.put(b"foo", b"bar")?;
+        assert!(matches!(
+            widgets.delete_bucket(b"foo"),
+            Err(Error::IncompatibleValue)
+        ));
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_DeleteBucket_Nested2
+#[test]
+fn test_bucket_delete_bucket_nested2() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let widgets = tx.create_bucket(b"widgets")?;
+        let foo = widgets.create_bucket(b"foo")?;
+        let bar = foo.create_bucket(b"bar")?;
+        bar.put(b"baz", b"bat")?;
+        Ok(())
+    })
+    .unwrap();
+    db.update(|tx| {
+        let widgets = tx.bucket(b"widgets").unwrap();
+        let foo = widgets.bucket(b"foo").unwrap();
+        let bar = foo.bucket(b"bar").unwrap();
+        assert_eq!(bar.get(b"baz").as_deref(), Some(&b"bat"[..]));
+        tx.delete_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        assert!(tx.bucket(b"widgets").is_none());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Put_Single (moderate deterministic subset of quick.Check)
+#[test]
+fn test_bucket_put_single() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    let keys: Vec<Vec<u8>> = (0..50).map(|i| format!("key{i:03}").into_bytes()).collect();
+    let mut expected = std::collections::HashMap::new();
+    for key in &keys {
+        let val = format!("val_{}", String::from_utf8_lossy(key)).into_bytes();
+        db.update(|tx| {
+            tx.bucket(b"widgets").unwrap().put(key, &val)?;
+            Ok(())
+        })
+        .unwrap();
+        expected.insert(key.clone(), val);
+        db.view(|tx| {
+            let b = tx.bucket(b"widgets").unwrap();
+            for (k, v) in &expected {
+                assert_eq!(b.get(k).as_deref(), Some(v.as_slice()));
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+// Go: TestBucket_Put_Multiple (moderate)
+#[test]
+fn test_bucket_put_multiple() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    let items: Vec<(Vec<u8>, Vec<u8>)> = (0..100)
+        .map(|i| (format!("k{i:04}").into_bytes(), format!("v{i:04}").into_bytes()))
+        .collect();
+    db.update(|tx| {
+        let b = tx.bucket(b"widgets").unwrap();
+        for (k, v) in &items {
+            b.put(k, v)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let b = tx.bucket(b"widgets").unwrap();
+        for (k, v) in &items {
+            assert_eq!(b.get(k).as_deref(), Some(v.as_slice()));
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Delete_Quick (moderate)
+#[test]
+fn test_bucket_delete_quick() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    let items: Vec<Vec<u8>> = (0..80).map(|i| format!("del{i:03}").into_bytes()).collect();
+    db.update(|tx| {
+        let b = tx.bucket(b"widgets").unwrap();
+        for k in &items {
+            b.put(k, k)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    for k in &items {
+        db.update(|tx| {
+            tx.bucket(b"widgets").unwrap().delete(k)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    db.view(|tx| {
+        tx.bucket(b"widgets").unwrap().for_each(|_k, v| {
+            assert!(v.is_none());
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Stats_EmptyBucket
+#[test]
+fn test_bucket_stats_empty_bucket() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        tx.create_bucket(b"whozawhats")?;
+        Ok(())
+    })
+    .unwrap();
+    common::must_check(&db);
+    db.view(|tx| {
+        let stats = tx.bucket(b"whozawhats").unwrap().stats();
+        assert_eq!(stats.branch_page_n, 0);
+        assert_eq!(stats.leaf_page_n, 0);
+        assert_eq!(stats.key_n, 0);
+        assert_eq!(stats.depth, 1);
+        assert_eq!(stats.bucket_n, 1);
+        assert_eq!(stats.inline_bucket_n, 1);
+        assert_eq!(stats.inline_bucket_inuse, 16);
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Stats_Small
+#[test]
+fn test_bucket_stats_small() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"whozawhats")?;
+        b.put(b"foo", b"bar")?;
+        Ok(())
+    })
+    .unwrap();
+    common::must_check(&db);
+    db.view(|tx| {
+        let stats = tx.bucket(b"whozawhats").unwrap().stats();
+        assert_eq!(stats.key_n, 1);
+        assert_eq!(stats.depth, 1);
+        assert_eq!(stats.bucket_n, 1);
+        assert_eq!(stats.inline_bucket_n, 1);
+        assert_eq!(stats.inline_bucket_inuse, 16 + 16 + 6);
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Stats_Nested
+#[test]
+fn test_bucket_stats_nested() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"foo")?;
+        for i in 0..100 {
+            b.put(format!("{i:02}").as_bytes(), format!("{i:02}").as_bytes())?;
+        }
+        let bar = b.create_bucket(b"bar")?;
+        for i in 0..10 {
+            bar.put(format!("{i}").as_bytes(), format!("{i}").as_bytes())?;
+        }
+        let baz = bar.create_bucket(b"baz")?;
+        for i in 0..10 {
+            baz.put(format!("{i}").as_bytes(), format!("{i}").as_bytes())?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    common::must_check(&db);
+    db.view(|tx| {
+        let stats = tx.bucket(b"foo").unwrap().stats();
+        assert_eq!(stats.leaf_page_n, 2);
+        assert_eq!(stats.key_n, 122);
+        assert_eq!(stats.depth, 3);
+        assert_eq!(stats.bucket_n, 3);
+        assert_eq!(stats.inline_bucket_n, 1);
+        let baz = 16 + 10 * 16 + 20;
+        assert_eq!(stats.inline_bucket_inuse, baz);
+        assert_eq!(stats.leaf_alloc, 8192);
+        Ok(())
+    })
+    .unwrap();
+}
+
 // Skipped: TestBucket_Get_FromNode — same as Put+Get in same tx (covered elsewhere).
-// Skipped: TestBucket_Get_IncompatibleValue, TestBucket_Get_Capacity — Go slice semantics.
+// Skipped: TestBucket_Get_Capacity — Go slice semantics.
 // Skipped: TestDB_Put_VeryLarge — long-running stress test (testing.Short).
 // Skipped: TestBucket_Put_Closed, TestBucket_Delete_Closed — closed tx via stale handle.
 // Skipped: TestBucket_Delete_FreelistOverflow — long stress test.
 // Skipped: TestBucket_Delete_ReadOnly — covered in errors_on_incompatible_and_readonly.
-// Skipped: TestBucket_DeleteBucket_Nested2, DeleteBucket_Large — extended delete variants.
-// Skipped: TestBucket_*_IncompatibleValue — create/delete bucket incompatible cases.
+// Skipped: TestBucket_DeleteBucket_Large — extended delete variant.
 // Skipped: TestBucket_NextSequence_Closed — closed tx.
-// Skipped: TestBucket_ForEachBucket_NoBuckets, ForEach_Closed — edge cases.
-// Skipped: TestBucket_Stats* — bucket stats API not ported.
+// Skipped: TestBucket_ForEach_Closed — edge cases.
+// Skipped: TestBucket_Stats, TestBucket_Stats_RandomFill, TestBucket_Stats_Large — long-running.

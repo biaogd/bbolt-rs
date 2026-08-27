@@ -651,8 +651,25 @@ mod tests {
         // Go: TestFreelist_free_freelist
         let mut f = Freelist::new(FreelistType::Array);
         f.free(100, 12, 0);
-        let txp = f.pending.get(&100).unwrap();
-        assert_eq!(txp.ids, vec![12]);
-        assert_eq!(txp.alloc_tx, vec![0]);
+        assert_eq!(f.pending_count(), 1);
+        assert!(f.freed(12));
+    }
+
+    // Go: TestFreelist_free_freelist_alloctx
+    #[test]
+    fn freelist_free_freelist_alloctx() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 12, 0);
+        f.rollback(100);
+        assert!(f.copy_all().is_empty());
+        assert_eq!(f.pending_count(), 0);
+        assert!(!f.freed(12));
+
+        f.free(101, 12, 0);
+        assert!(f.freed(12));
+        assert_eq!(f.pending_count(), 1);
+        f.release_pending_pages();
+        assert_eq!(f.pending_count(), 0);
+        assert_eq!(f.copy_all(), vec![12]);
     }
 }

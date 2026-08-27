@@ -252,6 +252,35 @@ fn test_simulate_100op_10p() {
 }
 
 #[test]
+fn test_simulate_1000op_10p() {
+    // Go: TestSimulate_1000op_10p
+    test_simulate(
+        Options {
+            page_size: 4096,
+            ..Options::default()
+        },
+        1,
+        1000,
+        10,
+    );
+}
+
+#[test]
+#[ignore = "slow; Go TestSimulate_100op_100p"]
+fn test_simulate_100op_100p() {
+    // Go: TestSimulate_100op_100p
+    test_simulate(
+        Options {
+            page_size: 4096,
+            ..Options::default()
+        },
+        1,
+        100,
+        100,
+    );
+}
+
+#[test]
 #[ignore = "slow; Go TestSimulate_10000op_* / 1000p monsters"]
 fn test_simulate_10000op_1p() {
     test_simulate(
@@ -324,6 +353,52 @@ fn test_simulate_no_freelist_sync_10op_10p() {
         1,
         10,
         10,
+    );
+}
+
+#[test]
+fn test_simulate_no_freelist_sync_1000op_1p() {
+    // Go: TestSimulateNoFreeListSync_1000op_1p
+    test_simulate(
+        Options {
+            no_freelist_sync: true,
+            page_size: 4096,
+            ..Options::default()
+        },
+        1,
+        1000,
+        1,
+    );
+}
+
+#[test]
+fn test_simulate_no_freelist_sync_1000op_10p() {
+    // Go: TestSimulateNoFreeListSync_1000op_10p
+    test_simulate(
+        Options {
+            no_freelist_sync: true,
+            page_size: 4096,
+            ..Options::default()
+        },
+        1,
+        1000,
+        10,
+    );
+}
+
+#[test]
+#[ignore = "slow; Go TestSimulateNoFreeListSync_100op_100p"]
+fn test_simulate_no_freelist_sync_100op_100p() {
+    // Go: TestSimulateNoFreeListSync_100op_100p
+    test_simulate(
+        Options {
+            no_freelist_sync: true,
+            page_size: 4096,
+            ..Options::default()
+        },
+        1,
+        100,
+        100,
     );
 }
 

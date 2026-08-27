@@ -69,9 +69,9 @@ pub struct DbInner {
     pub freelist_type: FreelistType,
     pub read_only: bool,
     pub max_size: usize,
-    pub alloc_size: usize,
-    pub max_batch_size: usize,
-    pub max_batch_delay: Duration,
+    pub alloc_size: AtomicUsize,
+    pub max_batch_size: AtomicUsize,
+    pub max_batch_delay: Mutex<Duration>,
     pub mmap_flags: i32,
     pub initial_mmap_size: usize,
     pub mmap: RwLock<MmapSlot>,
@@ -198,10 +198,11 @@ impl DbInner {
 
     fn grow_size(&self, grow_size: usize) -> usize {
         let datasz = self.mmap.read().datasz;
-        if datasz <= self.alloc_size {
+        let alloc = self.alloc_size.load(Ordering::Relaxed);
+        if datasz <= alloc {
             datasz.max(grow_size)
         } else {
-            grow_size + self.alloc_size
+            grow_size + alloc
         }
     }
 
@@ -394,6 +395,9 @@ impl Db {
     /// On Windows the mode is ignored.
     pub fn open<P: AsRef<Path>>(path: P, mode: u32, options: Option<Options>) -> Result<Self> {
         let path = path.as_ref();
+        if path.as_os_str().is_empty() {
+            return Err(Error::Corrupt("path required".into()));
+        }
         let mut opts = options.unwrap_or_default();
         let page_size = if opts.page_size == 0 {
             platform::os_page_size()
@@ -427,6 +431,11 @@ impl Db {
         }
 
         let file_len = file.metadata().map_err(|e| Error::io(path, e))?.len() as usize;
+        if file_len > 0 && file_len < page_size * 2 {
+            let _ = platform::funlock(&file);
+            return Err(Error::Corrupt(format!("file size too small {file_len}")));
+        }
+
         let map_hint = file_len.max(opts.initial_mmap_size).max(page_size * 4);
         #[cfg(windows)]
         {
@@ -463,7 +472,7 @@ impl Db {
             }
         };
 
-        let meta = pick_meta(&mmap).ok_or(Error::Invalid)?;
+        let meta = pick_meta(&mmap)?;
 
         let inner = Arc::new(DbInner {
             path: path.to_path_buf(),
@@ -475,9 +484,9 @@ impl Db {
             freelist_type: opts.freelist_type,
             read_only: opts.read_only,
             max_size: opts.max_size,
-            alloc_size: DEFAULT_ALLOC_SIZE,
-            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
-            max_batch_delay: Duration::from_millis(DEFAULT_MAX_BATCH_DELAY_MS),
+            alloc_size: AtomicUsize::new(DEFAULT_ALLOC_SIZE),
+            max_batch_size: AtomicUsize::new(DEFAULT_MAX_BATCH_SIZE),
+            max_batch_delay: Mutex::new(Duration::from_millis(DEFAULT_MAX_BATCH_DELAY_MS)),
             mmap_flags: opts.mmap_flags,
             initial_mmap_size: opts.initial_mmap_size,
             mmap: RwLock::new(mmap),
@@ -652,6 +661,23 @@ impl Db {
         crate::batch::batch(self, f)
     }
 
+    /// Set the maximum number of batch calls before a write transaction runs.
+    pub fn set_max_batch_size(&self, size: usize) {
+        self.inner
+            .max_batch_size
+            .store(size, Ordering::Relaxed);
+    }
+
+    /// Set the maximum delay before a partial batch is flushed.
+    pub fn set_max_batch_delay(&self, delay: Duration) {
+        *self.inner.max_batch_delay.lock() = delay;
+    }
+
+    /// Set the file growth step size (upstream `DB.AllocSize`).
+    pub fn set_alloc_size(&self, size: usize) {
+        self.inner.alloc_size.store(size, Ordering::Relaxed);
+    }
+
     /// Compact this database into `dst`.
     pub fn compact_into(&self, dst: &Db, tx_max_size: i64) -> Result<()> {
         crate::compact::compact(dst, self, tx_max_size)
@@ -746,51 +772,48 @@ fn get_page_size(file: &mut File, path: &Path, fallback: usize) -> Result<usize>
     Err(Error::Invalid)
 }
 
-fn pick_meta(slot: &MmapSlot) -> Option<Meta> {
-    let mmap = slot.mmap.as_ref()?;
+fn pick_meta(slot: &MmapSlot) -> Result<Meta> {
+    let mmap = slot.mmap.as_ref().ok_or(Error::InvalidMapping)?;
     if mmap.len() < PAGE_HEADER_SIZE + META_SIZE {
-        return None;
+        return Err(Error::Invalid);
     }
-    let hdr0 = PageHeader::read(mmap);
     let page_size = {
         let m = meta_from_page(mmap);
         if m.page_size == 0 {
-            return None;
+            return Err(Error::Invalid);
         }
         m.page_size as usize
     };
-    let meta0 = if hdr0.is_meta() {
-        let m = meta_from_page(mmap);
-        if m.validate().is_ok() {
-            Some(m)
-        } else {
-            None
+
+    let read_meta = |page: &[u8]| -> Result<Meta> {
+        let hdr = PageHeader::read(page);
+        if !hdr.is_meta() {
+            return Err(Error::Invalid);
         }
-    } else {
-        None
+        let m = meta_from_page(page);
+        m.validate()?;
+        Ok(m)
     };
+
+    let meta0 = read_meta(mmap);
     let meta1 = if mmap.len() >= page_size + PAGE_HEADER_SIZE + META_SIZE {
-        let p1 = &mmap[page_size..];
-        let m = meta_from_page(p1);
-        if m.validate().is_ok() {
-            Some(m)
-        } else {
-            None
-        }
+        read_meta(&mmap[page_size..])
     } else {
-        None
+        Err(Error::Invalid)
     };
-    match (meta0, meta1) {
-        (Some(a), Some(b)) => {
-            if a.txid > b.txid {
-                Some(a)
-            } else {
-                Some(b)
-            }
-        }
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+
+    match (&meta0, &meta1) {
+        (Ok(a), Ok(b)) => Ok(if a.txid > b.txid {
+            a.clone()
+        } else {
+            b.clone()
+        }),
+        (Ok(a), Err(_)) => Ok(a.clone()),
+        (Err(_), Ok(b)) => Ok(b.clone()),
+        (Err(_), Err(_)) => match meta0 {
+            Err(e) => Err(e),
+            Ok(_) => Err(Error::Invalid),
+        },
     }
 }
 
