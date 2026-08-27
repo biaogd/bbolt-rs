@@ -390,6 +390,52 @@ fn test_tx_stats_sub() {
     assert_eq!(diff.split, 3);
 }
 
+// Go: TestTxStats_add
+#[test]
+fn test_tx_stats_add() {
+    let a = bbolt::TxStats {
+        page_count: 1,
+        page_alloc: 2,
+        cursor_count: 3,
+        node_count: 100,
+        node_deref: 101,
+        rebalance: 1000,
+        rebalance_time_ns: 1_001_000_000_000, // 1001s
+        split: 10000,
+        spill: 10001,
+        spill_time_ns: 10_001_000_000_000,
+        write: 100000,
+        write_time_ns: 100_001_000_000_000,
+    };
+    let mut b = bbolt::TxStats {
+        page_count: 2,
+        page_alloc: 3,
+        cursor_count: 4,
+        node_count: 101,
+        node_deref: 102,
+        rebalance: 1001,
+        rebalance_time_ns: 1_002_000_000_000,
+        split: 11001,
+        spill: 11002,
+        spill_time_ns: 11_002_000_000_000,
+        write: 110001,
+        write_time_ns: 110_010_000_000_000,
+    };
+    b.add(&a);
+    assert_eq!(b.get_page_count(), 3);
+    assert_eq!(b.get_page_alloc(), 5);
+    assert_eq!(b.get_cursor_count(), 7);
+    assert_eq!(b.get_node_count(), 201);
+    assert_eq!(b.get_node_deref(), 203);
+    assert_eq!(b.get_rebalance(), 2001);
+    assert_eq!(b.get_rebalance_time_ns(), 2_003_000_000_000);
+    assert_eq!(b.get_split(), 21001);
+    assert_eq!(b.get_spill(), 21003);
+    assert_eq!(b.get_spill_time_ns(), 21_003_000_000_000);
+    assert_eq!(b.get_write(), 210001);
+    assert_eq!(b.get_write_time_ns(), 210_011_000_000_000);
+}
+
 // Go: TestTxStats_GetAndIncAtomically
 #[test]
 fn test_tx_stats_get_and_inc_atomically() {

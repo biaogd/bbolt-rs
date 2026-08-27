@@ -891,11 +891,154 @@ fn test_bucket_stats_large() {
     .unwrap();
 }
 
-// Skipped: TestBucket_Get_FromNode — same as Put+Get in same tx (covered elsewhere).
-// Skipped: TestBucket_Get_Capacity — Go slice semantics.
-// Skipped: TestDB_Put_VeryLarge — long-running stress test (testing.Short).
-// Skipped: TestBucket_Delete_FreelistOverflow — long stress test.
-// Skipped: TestBucket_DeleteBucket_Large — extended delete variant.
+// Go: TestBucket_Get_FromNode
+#[test]
+fn test_bucket_get_from_node() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.put(b"foo", b"bar")?;
+        assert_eq!(b.get(b"foo").as_deref(), Some(&b"bar"[..]));
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_DeleteBucket_Large
+#[test]
+fn test_bucket_delete_bucket_large() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let widgets = tx.create_bucket(b"widgets")?;
+        let foo = widgets.create_bucket(b"foo")?;
+        for i in 0..1000 {
+            foo.put(
+                format!("{i}").as_bytes(),
+                format!("{i:0100}").as_bytes(),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.update(|tx| {
+        tx.delete_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestDB_Put_VeryLarge — moderated default; full Go scale is #[ignore].
+#[test]
+fn test_db_put_very_large_moderate() {
+    let n = 5_000u32;
+    let batch_n = 2_500u32;
+    let (_dir, db) = must_create();
+    let mut i = 0u32;
+    while i < n {
+        db.update(|tx| {
+            let b = tx.create_bucket_if_not_exists(b"widgets")?;
+            for j in 0..batch_n {
+                let mut k = [0u8; 8];
+                let v = [0u8; 500];
+                k[..4].copy_from_slice(&(i + j).to_be_bytes());
+                b.put(&k, &v)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        i += batch_n;
+    }
+}
+
+// Go: TestDB_Put_VeryLarge
+#[test]
+#[ignore = "full Go scale (400k keys × 500B) is long-running; see moderate variant"]
+fn test_db_put_very_large() {
+    let n = 400_000u32;
+    let batch_n = 200_000u32;
+    let (_dir, db) = must_create();
+    let mut i = 0u32;
+    while i < n {
+        db.update(|tx| {
+            let b = tx.create_bucket_if_not_exists(b"widgets")?;
+            for j in 0..batch_n {
+                let mut k = [0u8; 8];
+                let v = [0u8; 500];
+                k[..4].copy_from_slice(&(i + j).to_be_bytes());
+                b.put(&k, &v)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        i += batch_n;
+    }
+}
+
+// Go: TestBucket_Delete_FreelistOverflow — moderated default; full Go scale #[ignore].
+#[test]
+fn test_bucket_delete_freelist_overflow_moderate() {
+    let (_dir, db) = must_create();
+    let page_size = db.info().page_size as u64;
+    let rounds = (2 * page_size).min(64);
+    let mut k = [0u8; 16];
+    for i in 0..rounds {
+        db.update(|tx| {
+            let b = tx.create_bucket_if_not_exists(b"0")?;
+            for j in 0..200u64 {
+                k[..8].copy_from_slice(&i.to_be_bytes());
+                k[8..].copy_from_slice(&j.to_be_bytes());
+                b.put(&k, &[])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    db.update(|tx| {
+        let b = tx.bucket(b"0").unwrap();
+        let mut c = b.cursor();
+        let mut kv = c.first().unwrap();
+        while kv.0.is_some() {
+            c.delete()?;
+            kv = c.next().unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Delete_FreelistOverflow
+#[test]
+#[ignore = "full Go scale (2*page_size × 1000 puts then mass delete) is long-running"]
+fn test_bucket_delete_freelist_overflow() {
+    let (_dir, db) = must_create();
+    let page_size = db.info().page_size as u64;
+    let mut k = [0u8; 16];
+    for i in 0..(2 * page_size) {
+        db.update(|tx| {
+            let b = tx.create_bucket_if_not_exists(b"0")?;
+            for j in 0..1000u64 {
+                k[..8].copy_from_slice(&i.to_be_bytes());
+                k[8..].copy_from_slice(&j.to_be_bytes());
+                b.put(&k, &[])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    db.update(|tx| {
+        let b = tx.bucket(b"0").unwrap();
+        let mut c = b.cursor();
+        let mut kv = c.first().unwrap();
+        while kv.0.is_some() {
+            c.delete()?;
+            kv = c.next().unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Skipped: TestBucket_Get_Capacity — Go slice `cap` semantics (Rust returns owned Vec).
 
 // Go: TestBucket_Put_Closed
 #[test]

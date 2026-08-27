@@ -29,26 +29,28 @@ Core operations and most of the public Go surface are implemented with on-disk f
 
 - **Windows**: flock / fdatasync / truncate-for-mmap implemented behind `cfg(windows)` but **not tested** on this Linux agent.
 - **`MmapFlags` / `Mlock`**: fields exist for API parity; memmap2 mapping does not apply arbitrary Linux `MAP_*` flags or `mlock`.
-- **Logger / StrictMode / full TxStats instrumentation**: TxStats Inc/Get API is ported; per-tx counters are stored on `TxInner` but not yet incremented on every spill/rebalance path. `OnCommit` is supported.
+- **Logger / StrictMode / full TxStats instrumentation**: TxStats Inc/Get/`add` API is ported; per-tx counters are stored on `TxInner` but not yet incremented on every spill/rebalance path. `OnCommit` is supported.
 - **Surgery / bench CLI subcommands**: not included (upstream-only maintenance tools).
 - Keys/values are returned as owned `Vec<u8>` (copied out of the mmap), not zero-copy slices.
 
 ## Upstream test suite coverage
 
-Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate maps **~215** of those names via `// Go: TestX` comments (grep `Go:`), including freelist E2E/SerDe, TxStats, Copy failWriter, releaseRange, QuickCheck, panic lifecycle, and bucket stats stress. `cargo test` runs **237** tests by default (**16** are `#[ignore]`).
+Go bbolt has ~281 `Test*` functions across ~46 `*_test.go` files. This crate maps **~233** of those names via `// Go: TestX` comments (grep `Go:`), including freelist E2E/SerDe, TxStats add/Inc/Get, Copy failWriter, releaseRange, QuickCheck, panic lifecycle, Check corruption, meta1 page-size fallback, ManyDBs, and bucket stress (moderated). `cargo test` runs **252** tests by default (**18** are `#[ignore]`).
 
 | Upstream file | Status |
 | --- | --- |
-| `db_test.go` | Most portable cases + panic lifecycle, close-pending-RW, batch panic, max-size reopen, concurrent WriteTo |
-| `bucket_test.go` | Most portable cases + `Bucket::stats()` Empty/Small/Nested/**Stats(4096)**; closed-tx Put/Delete/ForEach/NextSequence |
-| `tx_test.go` | CopyFile, OnCommit, `TxStats`, failWriter Copy errors, `releaseRange`, closed-tx errors |
+| `db_test.go` | Most portable cases + panic lifecycle, close-pending-RW, batch panic/time, max-size reopen + high mmap, BigPage, meta1 page-size, concurrent WriteTo |
+| `bucket_test.go` | Most portable cases + Get_FromNode, DeleteBucket_Large, moderated VeryLarge / FreelistOverflow; `Bucket::stats()` Empty/Small/Nested/**Stats(4096)**; closed-tx Put/Delete/ForEach/NextSequence |
+| `tx_test.go` | CopyFile, OnCommit, `TxStats` (Sub/Inc/add), failWriter Copy errors, `releaseRange`, closed-tx errors |
+| `tx_stats_test.go` | `TestTxStats_add` |
 | `cursor_test.go` | Seek/delete/iterate, seek-large, QuickCheck (forward/reverse/buckets), empty-page skips |
 | `movebucket_test.go` | Full table + DiffDB/DiffTx |
-| `tx_check_test.go` | Nest-bucket + corrupt page |
+| `tx_check_test.go` | Nest-bucket, corrupt page, Check_Panic, RecursivelyCheck (leaf / misplaced) |
+| `manydbs_test.go` | Moderated parallel open/put |
 | `concurrent_test.go` | Repeatable-read + generic R/W (simplified) |
 | `simulation_test.go` / `simulation_no_freelist_sync_test.go` | Through 1000op/10p (+ nfs 100op_10p); 100op_100p and 10000op monsters `#[ignore]` |
 | `internal/freelist/*_test.go` | Unit tests in `src/freelist.rs` including E2E happy path, SerDe across backends, `releaseRange` table |
-| `internal/common/page_test.go` | `page_type_names`, `merge_pgids` / `merge_pgids_quick` |
+| `internal/common/page_test.go` | `page_type_names`, `page_dump`, `merge_pgids` / `merge_pgids_quick` |
 | `node_test.go` | Leaf read/write + split MinKeys/SinglePage via bucket fills |
 | `db_whitebox_test.go` | PreLoadFreelist (+ allocate growth) |
 | `cmd/bbolt/command/*_test.go` | Smoke: version/info/buckets/keys/get/check/compact/pages/inspect/stats + no-args failures |
@@ -58,8 +60,12 @@ Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate map
 - `TestFreelist_E2E_SerDe_AcrossImplementations` at `n=0xFFFF*2` — memory/slow
 - `TestTx_TruncateBeforeWrite` — Rust `grow_size` stepping differs on Unix
 - `TestDB_Close_PendingTx_RO` — close does not block on open read-only txs
-- `TestBucket_Stats_Large` — full Go matrix is long-running
+- `TestBucket_Stats_Large` / full `TestDB_Put_VeryLarge` / `TestBucket_Delete_FreelistOverflow` — long-running (moderated variants run by default)
 - Simulation monsters (`100op_100p`, `10000op_*`) — runtime
+- `TestBucket_Get_Capacity` — Go slice `cap` (Rust returns owned `Vec`)
+- `TestDBUnmap` / `TestMethodPage` — whitebox reflect / unexported API
+- `TestOpen_MetaInitWriteError` — upstream pending
+- `TestOpen_Size_Large` / Windows MaxSize mmap variants — multi-GB or OS-specific
 
 Also: `tests/integration.rs` (format compatibility + feature smoke).
 

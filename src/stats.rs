@@ -120,6 +120,22 @@ impl TxStats {
         self.write_time_ns
     }
 
+    /// Accumulate another stats snapshot into `self` (upstream `TxStats.add`).
+    pub fn add(&mut self, other: &TxStats) {
+        self.page_count += other.page_count;
+        self.page_alloc += other.page_alloc;
+        self.cursor_count += other.cursor_count;
+        self.node_count += other.node_count;
+        self.node_deref += other.node_deref;
+        self.rebalance += other.rebalance;
+        self.rebalance_time_ns += other.rebalance_time_ns;
+        self.split += other.split;
+        self.spill += other.spill;
+        self.spill_time_ns += other.spill_time_ns;
+        self.write += other.write;
+        self.write_time_ns += other.write_time_ns;
+    }
+
     pub fn sub(&self, other: &TxStats) -> TxStats {
         TxStats {
             page_count: self.page_count - other.page_count,

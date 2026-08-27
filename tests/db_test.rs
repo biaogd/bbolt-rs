@@ -925,13 +925,169 @@ fn test_db_close_pending_tx(writable: bool) {
     }
 }
 
-// Skipped: TestOpen_ReadPageSize_* — meta fallback page-size tests.
-// Skipped: TestOpen_MetaInitWriteError — pending upstream.
+// Go: TestOpen_ReadPageSize_FromMeta1_OS
+#[test]
+fn test_open_read_page_size_from_meta1_os() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let os_ps = {
+        let db = bbolt::Db::open(&path, 0o600, None).unwrap();
+        let ps = db.info().page_size;
+        db.close().unwrap();
+        ps
+    };
+    // Corrupt meta0 by bumping pgid without fixing checksum (invalidates meta0).
+    let mut buf = std::fs::read(&path).unwrap();
+    let pgid_off = bbolt::PAGE_HEADER_SIZE + 40; // Meta::pgid
+    let pgid = u64::from_le_bytes(buf[pgid_off..pgid_off + 8].try_into().unwrap());
+    buf[pgid_off..pgid_off + 8].copy_from_slice(&(pgid + 1).to_le_bytes());
+    std::fs::write(&path, &buf).unwrap();
+
+    let db = bbolt::Db::open(&path, 0o600, None).unwrap();
+    assert_eq!(db.info().page_size, os_ps);
+    db.close().unwrap();
+}
+
+// Go: TestOpen_ReadPageSize_FromMeta1_Given
+#[test]
+fn test_open_read_page_size_from_meta1_given() {
+    // Full Go matrix goes to 16MiB pages; keep portable sizes that finish quickly.
+    for i in 0..=6u32 {
+        let given = 1024usize << i;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let db = bbolt::Db::open(
+                &path,
+                0o600,
+                Some(bbolt::Options {
+                    page_size: given,
+                    ..bbolt::Options::default()
+                }),
+            )
+            .unwrap();
+            assert_eq!(db.info().page_size, given);
+            db.close().unwrap();
+        }
+        if i % 3 == 0 {
+            let mut buf = std::fs::read(&path).unwrap();
+            let pgid_off = bbolt::PAGE_HEADER_SIZE + 40;
+            let pgid = u64::from_le_bytes(buf[pgid_off..pgid_off + 8].try_into().unwrap());
+            buf[pgid_off..pgid_off + 8].copy_from_slice(&(pgid + 1).to_le_bytes());
+            std::fs::write(&path, &buf).unwrap();
+        }
+        let db = bbolt::Db::open(&path, 0o600, None).unwrap();
+        assert_eq!(
+            db.info().page_size, given,
+            "page size mismatch for given={given}"
+        );
+        db.close().unwrap();
+    }
+}
+
+// Go: TestOpen_BigPage
+#[test]
+fn test_open_big_page() {
+    let os_ps = {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.db");
+        let db = Db::open(&path, 0o600, None).unwrap();
+        let ps = db.info().page_size;
+        db.close().unwrap();
+        ps
+    };
+    let dir1 = tempfile::tempdir().unwrap();
+    let path1 = dir1.path().join("a.db");
+    let db1 = Db::open(
+        &path1,
+        0o600,
+        Some(Options {
+            page_size: os_ps * 2,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    let sz1 = common::file_size(&path1);
+    db1.close().unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let path2 = dir2.path().join("b.db");
+    let db2 = Db::open(
+        &path2,
+        0o600,
+        Some(Options {
+            page_size: os_ps * 4,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    let sz2 = common::file_size(&path2);
+    db2.close().unwrap();
+    assert!(sz1 < sz2, "expected {sz1} < {sz2}");
+}
+
+// Go: TestDB_BatchTime
+#[test]
+fn test_db_batch_time() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    db.set_max_batch_size(1000);
+    db.set_max_batch_delay(std::time::Duration::from_millis(0));
+
+    let db2 = db.clone();
+    let handle = std::thread::spawn(move || {
+        db2.batch(|tx| {
+            tx.bucket(b"widgets")
+                .unwrap()
+                .put(&1u64.to_be_bytes(), &[])?;
+            Ok(())
+        })
+    });
+    handle.join().unwrap().unwrap();
+    db.view(|tx| {
+        assert!(tx
+            .bucket(b"widgets")
+            .unwrap()
+            .get(&1u64.to_be_bytes())
+            .is_some());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestDB_MaxSizeExceededCanOpenWithHighMmap
+#[test]
+fn test_db_max_size_exceeded_can_open_with_high_mmap() {
+    let parent = tempfile::tempdir().unwrap();
+    let (dir, db) = common::create_filled_db(parent.path(), 4 * 1024 * 1024, 2000);
+    let path = common::db_path(&dir);
+    db.close().unwrap();
+    let sz = common::file_size(&path);
+    assert!(sz >= 1024 * 1024);
+    let db = Db::open(
+        &path,
+        0o600,
+        Some(Options {
+            page_size: common::PAGE_SIZE,
+            max_size: 1,
+            initial_mmap_size: (sz as usize) * 2,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.close().unwrap();
+}
+
+// Skipped: TestOpen_MetaInitWriteError — upstream itself marks this pending.
 // Skipped: TestOpen_FileTooSmall — truncated file error string differs.
-// Skipped: TestDB_Concurrent_WriteTo_and_ConsistentRead — heavy concurrency stress.
-// Skipped: TestDB_BatchTime — batch timer edge case (covered by batch_full).
-// Skipped: TestDBUnmap — whitebox field inspection.
-// Skipped: TestDB_MaxSizeExceededCanOpenWithHighMmap — secondary max-size mmap scenario.
+// Skipped: TestDBUnmap — whitebox field inspection via reflect.
 // Skipped: TestDB_MaxSizeExceededDoesNotGrow, TestDB_WindowsMMapReadsAndWritesWithMaxSize —
 //          Windows-only (runtime.GOOS == "windows").
 // Skipped: TestDB_MaxSizeWithHighInitialMMapDoesNotGrowOnWrite — platform mmap behavior.
+// Skipped: TestOpen_Size_Large — multi-GB growth stress (testing.Short).
+// Skipped: TestMethodPage — whitebox *Page method.
+

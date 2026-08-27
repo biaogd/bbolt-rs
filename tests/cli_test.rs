@@ -68,6 +68,7 @@ fn cli_info_buckets_get_check() {
 
 #[test]
 fn cli_compact() {
+    // Go: TestCompactCommand_Run
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src.db");
     let dst = dir.path().join("dst.db");
@@ -199,6 +200,7 @@ fn cli_inspect() {
 
 #[test]
 fn cli_stats() {
+    // Go: TestStatsCommand_Run
     // Go: TestStatsCommand_Run_EmptyDatabase (smoke — Rust CLI prints freelist counters)
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
@@ -345,7 +347,10 @@ fn cli_no_args_fail() {
     // Go: TestInfoCommand_NoArgs
     // Go: TestGetCommand_NoArgs
     // Go: TestPagesCommand_NoArgs
-    for args in ["info", "get", "pages", "buckets", "check"] {
+    // Go: TestCompactCommand_NoArgs
+    // Go: TestKeyCommand_NoArgs
+    // Go: TestStatsCommand_NoArgs
+    for args in ["info", "get", "pages", "buckets", "check", "compact", "keys", "stats"] {
         let out = bbolt_bin().arg(args).output().unwrap();
         assert!(!out.status.success(), "expected failure for `{args}` with no path");
     }

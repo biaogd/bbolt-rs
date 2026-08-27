@@ -237,6 +237,19 @@ impl PageHeader {
         }
     }
 
+    /// Hex dump of the first `n` bytes of a page buffer (upstream `Page.hexdump`).
+    pub fn hexdump(page: &[u8], n: usize) -> String {
+        let n = n.min(page.len());
+        let mut out = String::with_capacity(n * 3);
+        for (i, b) in page[..n].iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+
     #[allow(dead_code)]
     pub fn element_size(&self) -> usize {
         if self.is_leaf() {
@@ -638,5 +651,16 @@ mod tests {
             .typ(),
             "unknown<4e20>"
         );
+    }
+
+    // Go: TestPage_dump
+    #[test]
+    fn page_dump() {
+        let mut page = vec![0u8; 256];
+        set_page_id(&mut page, 256);
+        let dump = PageHeader::hexdump(&page, 16);
+        assert!(!dump.is_empty());
+        // id is little-endian u64 at offset 0
+        assert!(dump.starts_with("00 01 00 00 00 00 00 00"));
     }
 }

@@ -104,4 +104,112 @@ fn test_tx_check_corrupt_page() {
     .unwrap();
 }
 
-// Skipped: TestTx_Check_Panic — requires corrupt root page flags and channel-based Check API.
+// Go: TestTx_Check_Panic
+#[test]
+fn test_tx_check_panic_corrupt_root_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    let db = common::must_create_db_in(dir.path());
+    common::fill_bucket(
+        &db,
+        b"data",
+        100,
+        |k| format!("{k:04}").into_bytes(),
+        |_| vec![0u8; 100],
+    )
+    .unwrap();
+    let root = must_bucket_root(&db, b"data");
+    db.close().unwrap();
+
+    // Corrupt branch/leaf flags on the bucket root page to 0.
+    let mut file = std::fs::read(&path).unwrap();
+    let off = root as usize * common::PAGE_SIZE;
+    file[off + 8] = 0; // flags low byte
+    file[off + 9] = 0;
+    std::fs::write(&path, &file).unwrap();
+
+    let db = common::reopen(&dir, None);
+    db.view(|tx| {
+        let errs = tx.check();
+        assert!(!errs.is_empty(), "expected check errors on corrupt root");
+        let msg = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(
+            msg.contains("unexpected type")
+                || msg.contains("invalid type")
+                || msg.contains("flags"),
+            "unexpected errors: {msg}"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestTx_RecursivelyCheckPages_CorruptedLeaf (key-order corruption on a leaf)
+#[test]
+fn test_tx_recursively_check_pages_corrupted_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    let db = common::must_create_db_in(dir.path());
+    common::fill_bucket(
+        &db,
+        b"data",
+        80,
+        |k| format!("{k:04}").into_bytes(),
+        |_| vec![0u8; 80],
+    )
+    .unwrap();
+    let root = must_bucket_root(&db, b"data");
+    db.close().unwrap();
+
+    let file = std::fs::read(&path).unwrap();
+    let leaves = leaf_pages_under_root(&file, root, common::PAGE_SIZE);
+    let victim = *leaves.last().unwrap_or(&root);
+    corrupt_leaf_key_order(&path, victim, common::PAGE_SIZE);
+
+    let db = common::reopen(&dir, None);
+    db.view(|tx| {
+        let errs = tx.check();
+        assert!(!errs.is_empty(), "expected leaf key-order corruption");
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestTx_RecursivelyCheckPages_MisplacedPage — page id claimed above HWM
+#[test]
+fn test_tx_recursively_check_pages_misplaced_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::db_path(&dir);
+    let db = common::must_create_db_in(dir.path());
+    db.update(|tx| {
+        let b = tx.create_bucket(b"data")?;
+        for i in 0..30u32 {
+            b.put(&i.to_be_bytes(), &i.to_be_bytes())?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let hwm = db.view(|tx| Ok(tx.high_water_mark())).unwrap();
+    let root = must_bucket_root(&db, b"data");
+    db.close().unwrap();
+
+    // Point a branch child pgid past the high water mark.
+    let mut file = std::fs::read(&path).unwrap();
+    let off = root as usize * common::PAGE_SIZE;
+    let hdr = PageHeader::read(&file[off..]);
+    if hdr.is_branch() && hdr.count > 0 {
+        let elem = PAGE_HEADER_SIZE;
+        // branch element pgid is at elem+8
+        let bad = (hwm + 10).to_le_bytes();
+        file[off + elem + 8..off + elem + 16].copy_from_slice(&bad);
+        std::fs::write(&path, &file).unwrap();
+
+        let db = common::reopen(&dir, None);
+        db.view(|tx| {
+            let errs = tx.check_with(CheckOptions { page_id: root });
+            assert!(!errs.is_empty(), "expected out-of-bounds page error");
+            Ok(())
+        })
+        .unwrap();
+    }
+}
