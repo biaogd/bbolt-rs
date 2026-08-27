@@ -6,7 +6,7 @@ bbolt is a single-writer / multiple-reader, ACID, serializable database in one f
 
 ## Status
 
-Core operations and most of the public Go surface are implemented with on-disk format compatibility. Fresh databases are byte-identical to Go bbolt at init; Go can read files this crate writes, and this crate can read files Go writes (`tests/fixtures/`, `cargo test`).
+Core operations and most of the public Go surface are implemented with on-disk format compatibility. Fresh databases are byte-identical to Go bbolt at init; Go can read files this crate writes, and this crate can read files Go writes — proven by the live Go oracle suite (`cargo test --test cross_go_test`) plus `tests/fixtures/`.
 
 ### At parity (practical)
 
@@ -35,7 +35,7 @@ Core operations and most of the public Go surface are implemented with on-disk f
 
 ## Upstream test suite coverage
 
-Go bbolt has ~281 `Test*` functions across ~46 `*_test.go` files. This crate maps **~233** of those names via `// Go: TestX` comments (grep `Go:`), including freelist E2E/SerDe, TxStats add/Inc/Get, Copy failWriter, releaseRange, QuickCheck, panic lifecycle, Check corruption, meta1 page-size fallback, ManyDBs, and bucket stress (moderated). `cargo test` runs **252** tests by default (**18** are `#[ignore]`).
+Go bbolt has ~281 `Test*` functions across ~46 `*_test.go` files. This crate maps **~233** of those names via `// Go: TestX` comments (grep `Go:`), including freelist E2E/SerDe, TxStats add/Inc/Get, Copy failWriter, releaseRange, QuickCheck, panic lifecycle, Check corruption, meta1 page-size fallback, ManyDBs, and bucket stress (moderated). `cargo test` runs **261** tests by default (**18** are `#[ignore]`), including **9** live Go↔Rust oracle tests.
 
 | Upstream file | Status |
 | --- | --- |
@@ -145,4 +145,43 @@ Integration coverage includes create/open, put/get/delete, nested buckets, curso
 - Copy-on-write pages, single writer, serializable snapshots for readers
 - Freelist may be omitted (`pgid = 0xffffffffffffffff`) when `NoFreelistSync` is set; reopen reconstructs free pages by scanning reachability from the root
 
-Verified: empty init file is byte-identical to Go; `tests/fixtures/go_sample.db` opens correctly; files written here open in Go bbolt.
+### Go↔Rust interchange (oracle suite)
+
+Automated cross-implementation tests live in `tests/cross_go_test.rs` and drive a small Go helper at `tests/go_oracle/` against **`go.etcd.io/bbolt` v1.5.0** (on-disk format v2; same family as current etcd-io/bbolt main).
+
+**Requirements:** `go` on `PATH` (with network once for module/`GOTOOLCHAIN=auto` download) and `python3` for JSON equality.
+
+```bash
+# Builds tests/go_oracle/go-oracle on first run, then exercises Go↔Rust.
+cargo test --test cross_go_test
+
+# Or build the oracle alone:
+cd tests/go_oracle && GOTOOLCHAIN=auto go build -o go-oracle .
+./go-oracle write -o /tmp/t.db -scenario mixed -pagesize 4096
+./go-oracle inspect -db /tmp/t.db
+./go-oracle check -db /tmp/t.db
+```
+
+**Proven compatible (tests fail on divergence):**
+
+| Check | Coverage |
+| --- | --- |
+| Fresh init bytes (page size 4096) | Rust empty DB == live Go init == `tests/fixtures/go_init.db` |
+| Go write → Rust read | sample, nested, sequences, overflow, page-split, deletes/freelist, multi-tx, mixed; array + hashmap freelist |
+| Rust write → Go read | same scenarios; Go `Check` + inspect tree match Rust |
+| Round-trip | Go→Rust mutate/commit→Go read; Rust→Go mutate→Rust read |
+| Compact / WriteTo | Go snapshot opens in Rust; Rust snapshot/`compact_into` opens in Go; inspect trees match |
+| Check | Healthy files pass both Go and Rust `Check` |
+| Behavior | Cursor lexicographic order, `ErrIncompatibleValue`, read-only tx rules, rollback, `NextSequence` persistence |
+
+Static fixtures `tests/fixtures/go_init.db` / `go_sample.db` remain as smoke coverage; the oracle suite regenerates live DBs each run.
+
+**Remaining holes (not claimed interchangeable here):**
+
+- Windows flock / mmap MaxSize speculative growth (OS-specific)
+- failpoint / dm-flakey / powerfailure injection
+- Surgery / bench CLI internals
+- Multi-GB `Open_Size_Large` stress
+- Exact freelist page byte layout after complex free/allocate churn may differ between array vs hashmap backends (logical free set and user data still match; both sides open each other’s files)
+- Live per-op TxStats counter instrumentation parity (API exists; not every spill path increments yet)
+

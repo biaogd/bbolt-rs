@@ -134,3 +134,6 @@ pub fn create_filled_db(
     .unwrap();
     (td, db)
 }
+
+pub mod go_oracle;
+
