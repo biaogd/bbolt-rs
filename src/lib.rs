@@ -22,19 +22,26 @@
 
 mod batch;
 mod bucket;
+mod check;
+mod compact;
 mod cursor;
 mod db;
 mod error;
 mod freelist;
 mod inner;
 mod page;
+mod platform;
+mod stats;
 mod tx;
 
 pub use bucket::Bucket;
+pub use check::CheckOptions;
+pub use compact::{compact, compact_files};
 pub use cursor::{Cursor, KeyValue};
 pub use db::{Db, Options};
 pub use error::{Error, Result};
+pub use freelist::FreelistType;
 pub use page::{DEFAULT_FILL_PERCENT, MAGIC, MAX_KEY_SIZE, MAX_VALUE_SIZE, VERSION};
+pub use page::{PageHeader, Pgid, Txid};
+pub use stats::{BucketStructure, Info, PageInfo, Stats, TxStats};
 pub use tx::Tx;
-
-pub use page::{Pgid, Txid};

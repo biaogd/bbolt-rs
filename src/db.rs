@@ -1,30 +1,29 @@
 //! Database file, mmap, allocation, and the public [`Db`] type.
 
-use std::fs::{File, OpenOptions};
+use std::collections::HashSet;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use memmap2::Mmap;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::error::{Error, Result};
-use crate::freelist::Freelist;
+use crate::freelist::{Freelist, FreelistType};
 use crate::inner::TxInner;
 use crate::page::{
-    meta_from_page, write_meta_page, InBucket, Meta, PageHeader, Pgid, Txid, DEFAULT_ALLOC_SIZE,
-    DEFAULT_MAX_BATCH_DELAY_MS, DEFAULT_MAX_BATCH_SIZE, FREELIST_PAGE_FLAG, LEAF_PAGE_FLAG, MAGIC,
-    MAX_MMAP_STEP, META_SIZE, PAGE_HEADER_SIZE, VERSION,
+    branch_at, leaf_at, meta_from_page, write_meta_page, InBucket, Meta, PageHeader, Pgid, Txid,
+    DEFAULT_ALLOC_SIZE, DEFAULT_MAX_BATCH_DELAY_MS, DEFAULT_MAX_BATCH_SIZE, FREELIST_PAGE_FLAG,
+    LEAF_PAGE_FLAG, MAGIC, MAX_MMAP_STEP, META_SIZE, PAGE_HEADER_SIZE, BUCKET_LEAF_FLAG, VERSION,
 };
+use crate::platform;
+use crate::stats::{Info, Stats};
 use crate::tx::Tx;
 use std::cell::RefCell;
 use std::rc::Rc;
-
-pub const FLOCK_RETRY: Duration = Duration::from_millis(50);
 
 pub struct FlagLock {
     locked: Mutex<bool>,
@@ -65,18 +64,28 @@ pub struct DbInner {
     pub page_size: usize,
     pub no_sync: bool,
     pub no_grow_sync: bool,
+    pub no_freelist_sync: bool,
+    #[allow(dead_code)] // retained for API / future freelist backend switches at runtime
+    pub freelist_type: FreelistType,
     pub read_only: bool,
     pub max_size: usize,
     pub alloc_size: usize,
     pub max_batch_size: usize,
     pub max_batch_delay: Duration,
+    pub mmap_flags: i32,
+    pub initial_mmap_size: usize,
     pub mmap: RwLock<MmapSlot>,
     pub writer: FlagLock,
     pub metalock: Mutex<()>,
     pub committed_meta: Mutex<Meta>,
     pub freelist: Mutex<Freelist>,
+    pub freelist_loaded: AtomicBool,
     pub opened: AtomicBool,
     pub batch: Mutex<crate::batch::BatchState>,
+    pub stats: Mutex<Stats>,
+    pub open_ro_tx: AtomicUsize,
+    pub tx_n: AtomicUsize,
+    pub no_statistics: bool,
 }
 
 impl DbInner {
@@ -105,20 +114,19 @@ impl DbInner {
     }
 
     pub fn write_at(&self, buf: &[u8], off: u64) -> Result<()> {
-        self.file.write_all_at(buf, off).map_err(|e| self.io(e))
+        platform::write_at(&self.file, buf, off).map_err(|e| self.io(e))
     }
 
     pub fn fdatasync(&self) -> Result<()> {
-        // SAFETY: `self.file` is an open fd owned by this `DbInner`.
-        let rc = unsafe { libc::fdatasync(self.file.as_raw_fd()) };
-        if rc != 0 {
-            return Err(self.io(std::io::Error::last_os_error()));
-        }
-        Ok(())
+        platform::fdatasync(&self.file)
     }
 
     pub fn file_size(&self) -> Result<u64> {
         Ok(self.file.metadata().map_err(|e| self.io(e))?.len())
+    }
+
+    pub fn has_synced_freelist(&self) -> bool {
+        self.committed_meta.lock().is_freelist_persisted()
     }
 
     #[allow(dead_code)]
@@ -142,26 +150,6 @@ impl DbInner {
         Ok(sz as usize)
     }
 
-    #[allow(dead_code)]
-    pub fn remap(&self, minsz: usize) -> Result<()> {
-        let file_size = self.file_size()? as usize;
-        let mut size = file_size.max(minsz);
-        size = Self::mmap_size(self.page_size, size)?;
-        if self.max_size > 0 && size > self.max_size && size > file_size {
-            // grow is checked at allocate time; mapping extra is ok on unix
-        }
-        let mut slot = self.mmap.write();
-        slot.mmap = None;
-        let mmap = map_file(
-            &self.file,
-            &self.path,
-            size.min(file_size.max(self.page_size * 2)),
-        )?;
-        slot.datasz = mmap.len();
-        slot.mmap = Some(mmap);
-        Ok(())
-    }
-
     /// Grow the mmap to at least `minsz` bytes, extending the mapping as the file grows.
     pub fn ensure_mapped(&self, minsz: usize) -> Result<()> {
         {
@@ -171,11 +159,20 @@ impl DbInner {
             }
         }
         let file_size = self.file_size()? as usize;
-        let need = minsz.max(file_size);
-        let map_len = need.max(file_size);
+        let need = minsz.max(file_size).max(self.initial_mmap_size);
+        #[cfg(windows)]
+        {
+            if !self.read_only && need > file_size {
+                platform::truncate_for_mmap(&self.file, need as u64)?;
+            }
+        }
+        let map_len = {
+            let fs = self.file_size()? as usize;
+            need.max(fs)
+        };
         let mut slot = self.mmap.write();
         slot.mmap = None;
-        let mmap = map_file(&self.file, &self.path, map_len)?;
+        let mmap = platform::map_file(&self.file, &self.path, map_len, self.mmap_flags)?;
         slot.datasz = mmap.len();
         slot.mmap = Some(mmap);
         Ok(())
@@ -187,9 +184,14 @@ impl DbInner {
             return Ok(());
         }
         let sz = self.grow_size(sz);
+        if self.max_size > 0 && sz > self.max_size {
+            return Err(Error::MaxSizeReached);
+        }
         if !self.no_grow_sync && !self.read_only {
             self.file.set_len(sz as u64).map_err(|e| self.io(e))?;
             self.file.sync_all().map_err(|e| self.io(e))?;
+        } else if !self.read_only {
+            self.file.set_len(sz as u64).map_err(|e| self.io(e))?;
         }
         Ok(())
     }
@@ -209,6 +211,9 @@ impl DbInner {
         count: usize,
         meta_pgid: &mut Pgid,
     ) -> Result<(Pgid, Vec<u8>)> {
+        if !self.freelist_loaded.load(Ordering::SeqCst) {
+            return Err(Error::FreePagesNotLoaded);
+        }
         let mut buf = vec![0u8; count * self.page_size];
         crate::page::set_page_overflow(&mut buf, (count - 1) as u32);
         let id = self.freelist.lock().allocate(txid, count);
@@ -222,8 +227,6 @@ impl DbInner {
             return Err(Error::MaxSizeReached);
         }
         if minsz > self.mmap.read().datasz {
-            // File may still be smaller; mapping uses file size. Allocation
-            // assigns pgids; grow() extends the file at commit.
             let _ = self.ensure_mapped(self.file_size()? as usize);
         }
         *meta_pgid = id + count as Pgid;
@@ -231,23 +234,103 @@ impl DbInner {
         Ok((id, buf))
     }
 
-    pub fn load_freelist(&self) -> Result<()> {
-        let meta = self.committed_meta.lock().clone();
-        let mut fl = self.freelist.lock();
-        if !meta.is_freelist_persisted() {
-            // Reconstructing via a full scan is not implemented; default
-            // path always persists the freelist.
-            fl.init(Vec::new());
+    pub fn ensure_freelist_loaded(&self) -> Result<()> {
+        if self.freelist_loaded.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let page = self.read_page(meta.freelist)?;
-        fl.read_page(&page);
+        self.load_freelist()
+    }
+
+    pub fn load_freelist(&self) -> Result<()> {
+        if self.freelist_loaded.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let meta = self.committed_meta.lock().clone();
+        let ids = if !meta.is_freelist_persisted() {
+            // Drop nothing: freepages does not take the freelist lock.
+            self.freepages()?
+        } else {
+            let page = self.read_page(meta.freelist)?;
+            let mut fl = self.freelist.lock();
+            fl.read_page(&page);
+            if !self.no_statistics {
+                let mut st = self.stats.lock();
+                st.free_page_n = fl.free_count();
+            }
+            return Ok(());
+        };
+        let mut fl = self.freelist.lock();
+        fl.init(ids);
+        if !self.no_statistics {
+            let mut st = self.stats.lock();
+            st.free_page_n = fl.free_count();
+        }
+        Ok(())
+    }
+
+    /// Reconstruct free page IDs by scanning reachable pages from the root bucket.
+    pub fn freepages(&self) -> Result<Vec<Pgid>> {
+        let meta = self.committed_meta.lock().clone();
+        let mut reachable = HashSet::new();
+        reachable.insert(0);
+        reachable.insert(1);
+        if meta.root.root != 0 {
+            self.mark_reachable(meta.root.root, &mut reachable)?;
+        }
+        let mut fids = Vec::new();
+        for i in 2..meta.pgid {
+            if !reachable.contains(&i) {
+                fids.push(i);
+            }
+        }
+        Ok(fids)
+    }
+
+    fn mark_reachable(&self, pgid: Pgid, reachable: &mut HashSet<Pgid>) -> Result<()> {
+        let page = self.read_page(pgid)?;
+        let hdr = PageHeader::read(&page);
+        for i in 0..=hdr.overflow {
+            reachable.insert(hdr.id + Pgid::from(i));
+        }
+        if hdr.is_branch() {
+            for i in 0..hdr.count as usize {
+                let (child, _) = branch_at(&page, i);
+                self.mark_reachable(child, reachable)?;
+            }
+        } else if hdr.is_leaf() {
+            for i in 0..hdr.count as usize {
+                let (flags, _k, v) = leaf_at(&page, i);
+                if flags & BUCKET_LEAF_FLAG != 0 && v.len() >= 16 {
+                    let ib = InBucket::read(v);
+                    if ib.root != 0 {
+                        self.mark_reachable(ib.root, reachable)?;
+                    }
+                } else if !v.is_empty() {
+                    // Overflow value pages: encoded as pgid in value for large values.
+                    // Upstream stores overflow pgid in the leaf when value spills;
+                    // our port uses contiguous overflow on the same leaf allocation.
+                    let _ = v;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn reload_freelist_after_rollback(&self) -> Result<()> {
+        if !self.has_synced_freelist() {
+            let ids = self.freepages()?;
+            self.freelist.lock().no_sync_reload(ids);
+        } else {
+            let meta = self.committed_meta.lock().clone();
+            let page = self.read_page(meta.freelist)?;
+            self.freelist.lock().reload(&page);
+        }
         Ok(())
     }
 }
 
 /// Options for [`Db::open`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Options {
     pub timeout: Option<Duration>,
     pub no_grow_sync: bool,
@@ -257,6 +340,32 @@ pub struct Options {
     pub initial_mmap_size: usize,
     pub max_size: usize,
     pub no_freelist_sync: bool,
+    pub pre_load_freelist: bool,
+    pub freelist_type: FreelistType,
+    /// Extra mmap flags (Unix). Accepted for API parity; not applied via memmap2.
+    pub mmap_flags: i32,
+    pub mlock: bool,
+    pub no_statistics: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            timeout: None,
+            no_grow_sync: false,
+            no_sync: false,
+            read_only: false,
+            page_size: 0,
+            initial_mmap_size: 0,
+            max_size: 0,
+            no_freelist_sync: false,
+            pre_load_freelist: false,
+            freelist_type: FreelistType::Array,
+            mmap_flags: 0,
+            mlock: false,
+            no_statistics: false,
+        }
+    }
 }
 
 impl Options {
@@ -282,11 +391,12 @@ impl Db {
     /// Open or create a database file.
     ///
     /// `mode` is the Unix file mode used when creating the file (e.g. `0o600`).
+    /// On Windows the mode is ignored.
     pub fn open<P: AsRef<Path>>(path: P, mode: u32, options: Option<Options>) -> Result<Self> {
         let path = path.as_ref();
-        let opts = options.unwrap_or_default();
+        let mut opts = options.unwrap_or_default();
         let page_size = if opts.page_size == 0 {
-            os_page_size()
+            platform::os_page_size()
         } else {
             opts.page_size
         };
@@ -296,28 +406,57 @@ impl Db {
             )));
         }
 
-        let mut open = OpenOptions::new();
-        open.read(true);
-        if opts.read_only {
-            open.write(false);
-        } else {
-            open.write(true).create(true).mode(mode);
+        // Writable opens always load the freelist (upstream).
+        if !opts.read_only {
+            opts.pre_load_freelist = true;
         }
-        let mut file = open.open(path).map_err(|e| Error::io(path, e))?;
 
-        flock(&file, !opts.read_only, opts.timeout)?;
+        let mut file = platform::open_db_file(path, opts.read_only, mode)?;
+        platform::flock(&file, !opts.read_only, opts.timeout)?;
 
         let file_len = file.metadata().map_err(|e| Error::io(path, e))?.len();
         let mut page_size = page_size;
         if file_len == 0 {
+            if opts.read_only {
+                let _ = platform::funlock(&file);
+                return Err(Error::Invalid);
+            }
             init_file(&mut file, path, page_size)?;
         } else {
             page_size = get_page_size(&mut file, path, page_size)?;
         }
 
+        let file_len = file.metadata().map_err(|e| Error::io(path, e))?.len() as usize;
+        let map_hint = file_len.max(opts.initial_mmap_size).max(page_size * 4);
+        #[cfg(windows)]
+        {
+            if !opts.read_only && opts.initial_mmap_size > file_len {
+                let aligned = ((opts.initial_mmap_size + page_size - 1) / page_size) * page_size;
+                platform::truncate_for_mmap(&file, aligned as u64)?;
+            }
+        }
+        // Prefer at least the file size; InitialMmapSize may request a larger mapping.
+        let map_len = {
+            let fs = file.metadata().map_err(|e| Error::io(path, e))?.len() as usize;
+            let want = fs.max(opts.initial_mmap_size).max(map_hint.min(fs.max(page_size * 2)));
+            #[cfg(unix)]
+            {
+                // On Unix, mapping beyond EOF is not used; map the file size.
+                let _ = want;
+                fs.max(page_size * 2)
+            }
+            #[cfg(windows)]
+            {
+                want.max(page_size * 2)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                fs.max(page_size * 2)
+            }
+        };
+
         let mmap = {
-            let len = file.metadata().map_err(|e| Error::io(path, e))?.len() as usize;
-            let mmap = map_file(&file, path, len)?;
+            let mmap = platform::map_file(&file, path, map_len, opts.mmap_flags)?;
             MmapSlot {
                 datasz: mmap.len(),
                 mmap: Some(mmap),
@@ -332,24 +471,33 @@ impl Db {
             page_size,
             no_sync: opts.no_sync,
             no_grow_sync: opts.no_grow_sync,
+            no_freelist_sync: opts.no_freelist_sync,
+            freelist_type: opts.freelist_type,
             read_only: opts.read_only,
             max_size: opts.max_size,
             alloc_size: DEFAULT_ALLOC_SIZE,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             max_batch_delay: Duration::from_millis(DEFAULT_MAX_BATCH_DELAY_MS),
+            mmap_flags: opts.mmap_flags,
+            initial_mmap_size: opts.initial_mmap_size,
             mmap: RwLock::new(mmap),
             writer: FlagLock::new(),
             metalock: Mutex::new(()),
             committed_meta: Mutex::new(meta),
-            freelist: Mutex::new(Freelist::new()),
+            freelist: Mutex::new(Freelist::new(opts.freelist_type)),
+            freelist_loaded: AtomicBool::new(false),
             opened: AtomicBool::new(true),
             batch: Mutex::new(crate::batch::BatchState::default()),
+            stats: Mutex::new(Stats::default()),
+            open_ro_tx: AtomicUsize::new(0),
+            tx_n: AtomicUsize::new(0),
+            no_statistics: opts.no_statistics,
         });
 
-        if !opts.read_only {
+        let _ = opts.mlock; // API parity; mlock not wired through memmap2 yet.
+
+        if opts.pre_load_freelist {
             inner.load_freelist()?;
-        } else if !opts.no_freelist_sync {
-            // read-only may still load freelist for stats; skip if not requested
         }
 
         if !opts.read_only && !opts.no_freelist_sync {
@@ -381,6 +529,29 @@ impl Db {
         self.inner.fdatasync()
     }
 
+    pub fn info(&self) -> Info {
+        Info {
+            page_size: self.inner.page_size,
+        }
+    }
+
+    pub fn stats(&self) -> Stats {
+        if self.inner.no_statistics {
+            return Stats::default();
+        }
+        let mut st = self.inner.stats.lock().clone();
+        st.open_tx_n = self.inner.open_ro_tx.load(Ordering::SeqCst);
+        st.tx_n = self.inner.tx_n.load(Ordering::SeqCst);
+        if self.inner.freelist_loaded.load(Ordering::SeqCst) {
+            let fl = self.inner.freelist.lock();
+            st.free_page_n = fl.free_count();
+            st.pending_page_n = fl.pending_count();
+            st.free_alloc = (st.free_page_n + st.pending_page_n) * self.inner.page_size;
+            st.freelist_inuse = fl.estimated_write_page_size();
+        }
+        st
+    }
+
     /// Start a transaction. Only one write transaction may be active at a time.
     pub fn begin(&self, writable: bool) -> Result<Tx> {
         if !self.inner.opened.load(Ordering::SeqCst) {
@@ -390,6 +561,7 @@ impl Db {
             if self.inner.read_only {
                 return Err(Error::DatabaseReadOnly);
             }
+            self.inner.ensure_freelist_loaded()?;
             self.inner.writer.lock();
             let _g = self.inner.metalock.lock();
             if !self.inner.opened.load(Ordering::SeqCst) {
@@ -416,7 +588,11 @@ impl Db {
                 return Err(Error::InvalidMapping);
             }
             let meta = self.inner.committed_meta.lock().clone();
-            self.inner.freelist.lock().add_readonly_txid(meta.txid);
+            if self.inner.freelist_loaded.load(Ordering::SeqCst) {
+                self.inner.freelist.lock().add_readonly_txid(meta.txid);
+            }
+            self.inner.open_ro_tx.fetch_add(1, Ordering::SeqCst);
+            self.inner.tx_n.fetch_add(1, Ordering::SeqCst);
             let tx = TxInner::new(Arc::clone(&self.inner), meta, false);
             Ok(Tx {
                 inner: Rc::new(RefCell::new(tx)),
@@ -476,6 +652,11 @@ impl Db {
         crate::batch::batch(self, f)
     }
 
+    /// Compact this database into `dst`.
+    pub fn compact_into(&self, dst: &Db, tx_max_size: i64) -> Result<()> {
+        crate::compact::compact(dst, self, tx_max_size)
+    }
+
     pub fn close(&self) -> Result<()> {
         if !self.inner.opened.swap(false, Ordering::SeqCst) {
             return Ok(());
@@ -487,9 +668,7 @@ impl Db {
             slot.mmap = None;
             slot.datasz = 0;
         }
-        if !self.inner.read_only {
-            let _ = funlock(&self.inner.file);
-        }
+        let _ = platform::funlock(&self.inner.file);
         self.inner.writer.unlock();
         Ok(())
     }
@@ -500,66 +679,6 @@ impl Drop for Db {
         if Arc::strong_count(&self.inner) == 1 {
             let _ = self.close();
         }
-    }
-}
-
-fn os_page_size() -> usize {
-    // SAFETY: sysconf(_SC_PAGESIZE) has no preconditions.
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n > 0 {
-        n as usize
-    } else {
-        4096
-    }
-}
-
-fn flock(file: &File, exclusive: bool, timeout: Option<Duration>) -> Result<()> {
-    let start = Instant::now();
-    let mut flag = libc::LOCK_NB;
-    flag |= if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    };
-    loop {
-        // SAFETY: `file` is open; flock is the POSIX advisory-lock interface.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), flag) };
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        let code = err.raw_os_error();
-        if code != Some(libc::EWOULDBLOCK) && code != Some(libc::EAGAIN) {
-            return Err(Error::io("<flock>", err));
-        }
-        if let Some(t) = timeout {
-            if start.elapsed() + FLOCK_RETRY >= t {
-                return Err(Error::Timeout);
-            }
-        }
-        std::thread::sleep(FLOCK_RETRY);
-    }
-}
-
-fn funlock(file: &File) -> Result<()> {
-    // SAFETY: `file` is open; LOCK_UN releases a lock we acquired.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    if rc != 0 {
-        return Err(Error::io("<funlock>", std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-fn map_file(file: &File, path: impl AsRef<Path>, len: usize) -> Result<Mmap> {
-    // SAFETY: `file` remains open for the lifetime of the mapping. Callers drop
-    // the `Mmap` before closing the file. Like upstream bbolt, an external
-    // truncate of the file can cause SIGBUS on access.
-    let path = path.as_ref();
-    unsafe {
-        memmap2::MmapOptions::new()
-            .len(len)
-            .map(file)
-            .map_err(|e| Error::io(path, e))
     }
 }
 
@@ -579,14 +698,11 @@ fn init_file(file: &mut File, path: &Path, page_size: usize) -> Result<()> {
         };
         meta.finish_checksum();
         write_meta_page(&mut buf[i as usize * page_size..], &meta);
-        // write_meta_page sets id from txid%2, which matches i.
     }
-    // page 2: empty freelist
     let p2 = &mut buf[2 * page_size..3 * page_size];
     crate::page::set_page_id(p2, 2);
     crate::page::set_page_flags(p2, FREELIST_PAGE_FLAG);
     crate::page::set_page_count(p2, 0);
-    // page 3: empty leaf (root bucket)
     let p3 = &mut buf[3 * page_size..4 * page_size];
     crate::page::set_page_id(p3, 3);
     crate::page::set_page_flags(p3, LEAF_PAGE_FLAG);

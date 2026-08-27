@@ -548,3 +548,251 @@ fn magic_and_version_on_disk() {
     assert_eq!(&bytes[16..20], &bbolt::MAGIC.to_le_bytes());
     assert_eq!(&bytes[20..24], &bbolt::VERSION.to_le_bytes());
 }
+
+#[test]
+fn hashmap_freelist_put_get_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hm.db");
+    {
+        let db = Db::open(
+            &path,
+            0o600,
+            Some(Options {
+                page_size: 4096,
+                freelist_type: bbolt::FreelistType::HashMap,
+                ..Options::default()
+            }),
+        )
+        .unwrap();
+        db.update(|tx| {
+            let b = tx.create_bucket(b"data")?;
+            for i in 0..200u32 {
+                b.put(&i.to_le_bytes(), &i.to_le_bytes())?;
+            }
+            for i in 0..100u32 {
+                b.delete(&i.to_le_bytes())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        db.close().unwrap();
+    }
+    let db = Db::open(
+        &path,
+        0o600,
+        Some(Options {
+            page_size: 4096,
+            freelist_type: bbolt::FreelistType::HashMap,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.view(|tx| {
+        let b = tx.bucket(b"data").unwrap();
+        for i in 100..200u32 {
+            assert_eq!(b.get(&i.to_le_bytes()).as_deref(), Some(&i.to_le_bytes()[..]));
+        }
+        assert!(b.get(&0u32.to_le_bytes()).is_none());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn no_freelist_sync_recovers_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nfs.db");
+    {
+        let db = Db::open(
+            &path,
+            0o600,
+            Some(Options {
+                page_size: 4096,
+                no_freelist_sync: true,
+                ..Options::default()
+            }),
+        )
+        .unwrap();
+        db.update(|tx| {
+            let b = tx.create_bucket(b"b")?;
+            for i in 0..50u8 {
+                b.put(&[i], &[i])?;
+            }
+            for i in 0..25u8 {
+                b.delete(&[i])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        db.close().unwrap();
+    }
+    // Reopen with freelist sync so recovery + flush happens.
+    let db = Db::open(
+        &path,
+        0o600,
+        Some(Options {
+            page_size: 4096,
+            no_freelist_sync: false,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.view(|tx| {
+        let b = tx.bucket(b"b").unwrap();
+        for i in 25..50u8 {
+            assert_eq!(b.get(&[i]).as_deref(), Some(&[i][..]));
+        }
+        let errs = tx.check();
+        assert!(errs.is_empty(), "{errs:?}");
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn check_ok_on_healthy_db() {
+    let (_dir, db) = open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.put(b"a", b"1")?;
+        b.put(b"b", b"2")?;
+        let n = b.create_bucket(b"nested")?;
+        n.put(b"x", b"y")?;
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let errs = tx.check();
+        assert!(errs.is_empty(), "{errs:?}");
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn compact_preserves_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.db");
+    let dst = dir.path().join("dst.db");
+    {
+        let db = Db::open(
+            &src,
+            0o600,
+            Some(Options {
+                page_size: 4096,
+                ..Options::default()
+            }),
+        )
+        .unwrap();
+        db.update(|tx| {
+            let b = tx.create_bucket(b"people")?;
+            b.set_sequence(9)?;
+            b.put(b"alice", b"1")?;
+            b.put(b"bob", b"2")?;
+            let n = b.create_bucket(b"meta")?;
+            n.put(b"k", b"v")?;
+            Ok(())
+        })
+        .unwrap();
+        // create free pages
+        db.update(|tx| {
+            let b = tx.bucket(b"people").unwrap();
+            b.delete(b"bob")?;
+            Ok(())
+        })
+        .unwrap();
+        db.close().unwrap();
+    }
+    bbolt::compact_files(&dst, &src, 0, 4096).unwrap();
+    let db = Db::open(
+        &dst,
+        0o600,
+        Some(Options {
+            page_size: 4096,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.view(|tx| {
+        let b = tx.bucket(b"people").unwrap();
+        assert_eq!(b.sequence(), 9);
+        assert_eq!(b.get(b"alice").as_deref(), Some(&b"1"[..]));
+        assert!(b.get(b"bob").is_none());
+        assert_eq!(
+            b.bucket(b"meta").unwrap().get(b"k").as_deref(),
+            Some(&b"v"[..])
+        );
+        assert!(tx.check().is_empty());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn write_to_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.db");
+    let copy = dir.path().join("copy.db");
+    let db = Db::open(
+        &path,
+        0o600,
+        Some(Options {
+            page_size: 4096,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"b")?;
+        b.put(b"k", b"v")?;
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        tx.copy_file(&copy, 0o600)?;
+        Ok(())
+    })
+    .unwrap();
+    let db2 = Db::open(
+        &copy,
+        0o600,
+        Some(Options {
+            page_size: 4096,
+            read_only: true,
+            pre_load_freelist: true,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db2.view(|tx| {
+        assert_eq!(
+            tx.bucket(b"b").unwrap().get(b"k").as_deref(),
+            Some(&b"v"[..])
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn inspect_and_stats() {
+    let (_dir, db) = open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"rootish")?;
+        b.put(b"a", b"1")?;
+        b.create_bucket(b"child")?;
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let tree = tx.inspect();
+        assert_eq!(tree.name, "root");
+        assert!(!tree.children.is_empty());
+        Ok(())
+    })
+    .unwrap();
+    let st = db.stats();
+    let _ = st.free_page_n;
+    assert_eq!(db.info().page_size, 4096);
+}
+

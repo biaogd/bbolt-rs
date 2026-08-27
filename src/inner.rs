@@ -1496,7 +1496,11 @@ impl TxInner {
                     .free(self.meta.txid, self.meta.freelist, hdr.overflow);
             }
         }
-        self.commit_freelist()?;
+        if !self.db.no_freelist_sync {
+            self.commit_freelist()?;
+        } else {
+            self.meta.freelist = PGID_NO_FREELIST;
+        }
 
         if self.meta.pgid > opgid {
             let sz = (self.meta.pgid as usize + 1) * self.db.page_size;
@@ -1567,16 +1571,42 @@ impl TxInner {
         self.close_internal();
     }
 
+    /// Error-path rollback that also reloads freelist from disk / scan (Go `tx.rollback`).
+    #[allow(dead_code)]
+    pub fn rollback_and_reload(&mut self) {
+        if self.closed {
+            return;
+        }
+        if self.writable {
+            self.db.freelist.lock().rollback(self.meta.txid);
+            let _ = self.db.reload_freelist_after_rollback();
+        }
+        self.close_internal();
+    }
+
     fn close_internal(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
         if self.hold_writer {
+            if !self.db.no_statistics {
+                let fl = self.db.freelist.lock();
+                let mut st = self.db.stats.lock();
+                st.free_page_n = fl.free_count();
+                st.pending_page_n = fl.pending_count();
+                st.free_alloc = (st.free_page_n + st.pending_page_n) * self.db.page_size;
+                st.freelist_inuse = fl.estimated_write_page_size();
+            }
             self.db.writer.unlock();
             self.hold_writer = false;
         } else {
-            self.db.freelist.lock().remove_readonly_txid(self.meta.txid);
+            self.db
+                .open_ro_tx
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if self.db.freelist_loaded.load(std::sync::atomic::Ordering::SeqCst) {
+                self.db.freelist.lock().remove_readonly_txid(self.meta.txid);
+            }
         }
         self.dirty.clear();
     }
