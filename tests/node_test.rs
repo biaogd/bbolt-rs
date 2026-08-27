@@ -6,7 +6,8 @@ use bbolt::{
     LEAF_PAGE_FLAG, PAGE_HEADER_SIZE,
 };
 
-// Go: TestNode_write_LeafPage / TestNode_read_LeafPage (combined round-trip)
+// Go: TestNode_write_LeafPage
+// Go: TestNode_read_LeafPage (combined round-trip)
 #[test]
 fn test_node_leaf_page_roundtrip() {
     let mut page = vec![0u8; 4096];
@@ -128,8 +129,7 @@ fn test_node_read_leaf_page() {
     assert_eq!(got[1].value, b"bye");
 }
 
-// Go: TestNode_split / TestNode_split_MinKeys / TestNode_split_SinglePage —
-// node internals are unexported; bucket fills exercise the same split paths.
+// Go: TestNode_split
 #[test]
 fn test_node_split_via_bucket() {
     let db = bbolt::Db::open(

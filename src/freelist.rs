@@ -488,7 +488,8 @@ impl Freelist {
 mod tests {
     use super::*;
 
-    // Go: TestFreelistArray_allocate / TestFreelistHashmap_allocate
+    // Go: TestFreelistArray_allocate
+    // Go: TestFreelistHashmap_allocate
     #[test]
     fn array_allocate_contiguous() {
         // Go: TestFreelistArray_allocate
@@ -581,7 +582,8 @@ mod tests {
         assert_eq!(f.free_page_ids(), vec![9, 12, 13, 39]);
     }
 
-    // Go: TestFreeList_init / TestFreeList_reload (array backend)
+    // Go: TestFreeList_init
+    // Go: TestFreeList_reload (array backend)
     #[test]
     fn freelist_init_and_reload() {
         let mut buf = vec![0u8; 4096];
@@ -676,7 +678,9 @@ mod tests {
         assert_eq!(f.copy_all(), vec![12]);
     }
 
-    // Go: TestFreeList_init / TestFreelist_write / TestFreelist_read
+    // Go: TestFreeList_init
+    // Go: TestFreelist_write
+    // Go: TestFreelist_read
     #[test]
     fn freelist_write_read_roundtrip() {
         let mut f = Freelist::new(FreelistType::Array);

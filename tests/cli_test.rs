@@ -342,7 +342,9 @@ fn cli_check_command_run() {
 
 #[test]
 fn cli_no_args_fail() {
-    // Go: TestInfoCommand_NoArgs / TestGetCommand_NoArgs / TestPagesCommand_NoArgs (smoke)
+    // Go: TestInfoCommand_NoArgs
+    // Go: TestGetCommand_NoArgs
+    // Go: TestPagesCommand_NoArgs
     for args in ["info", "get", "pages", "buckets", "check"] {
         let out = bbolt_bin().arg(args).output().unwrap();
         assert!(!out.status.success(), "expected failure for `{args}` with no path");
