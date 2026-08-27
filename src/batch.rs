@@ -1,5 +1,6 @@
 //! Coalesced write transactions (upstream `DB.Batch`).
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -21,6 +22,13 @@ struct Call {
 pub struct BatchState {
     calls: Vec<Call>,
     scheduled: bool,
+}
+
+fn safely_call(f: &BatchFn, tx: &Tx) -> Result<()> {
+    match catch_unwind(AssertUnwindSafe(|| f(tx))) {
+        Ok(r) => r,
+        Err(_) => Err(Error::Corrupt("batch function panicked".into())),
+    }
 }
 
 pub fn batch<F>(db: &Db, f: F) -> Result<()>
@@ -75,7 +83,7 @@ fn run_calls(db: &Db, mut calls: Vec<Call>) {
         let mut fail_idx: Option<usize> = None;
         let result = db.update(|tx| {
             for (i, c) in calls.iter().enumerate() {
-                if let Err(e) = (c.f)(tx) {
+                if let Err(e) = safely_call(&c.f, tx) {
                     fail_idx = Some(i);
                     return Err(e);
                 }

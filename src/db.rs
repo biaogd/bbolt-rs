@@ -684,11 +684,16 @@ impl Db {
     }
 
     pub fn close(&self) -> Result<()> {
-        if !self.inner.opened.swap(false, Ordering::SeqCst) {
+        if !self.inner.opened.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // Wait for the writer lock before marking closed so in-flight txs can finish.
         self.inner.writer.lock();
         let _m = self.inner.metalock.lock();
+        if !self.inner.opened.swap(false, Ordering::SeqCst) {
+            self.inner.writer.unlock();
+            return Ok(());
+        }
         {
             let mut slot = self.inner.mmap.write();
             slot.mmap = None;

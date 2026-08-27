@@ -47,6 +47,79 @@ pub struct TxStats {
 }
 
 impl TxStats {
+    pub fn inc_page_count(&mut self, n: i64) {
+        self.page_count += n;
+    }
+    pub fn get_page_count(&self) -> i64 {
+        self.page_count
+    }
+    pub fn inc_page_alloc(&mut self, n: i64) {
+        self.page_alloc += n;
+    }
+    pub fn get_page_alloc(&self) -> i64 {
+        self.page_alloc
+    }
+    pub fn inc_cursor_count(&mut self, n: i64) {
+        self.cursor_count += n;
+    }
+    pub fn get_cursor_count(&self) -> i64 {
+        self.cursor_count
+    }
+    pub fn inc_node_count(&mut self, n: i64) {
+        self.node_count += n;
+    }
+    pub fn get_node_count(&self) -> i64 {
+        self.node_count
+    }
+    pub fn inc_node_deref(&mut self, n: i64) {
+        self.node_deref += n;
+    }
+    pub fn get_node_deref(&self) -> i64 {
+        self.node_deref
+    }
+    pub fn inc_rebalance(&mut self, n: i64) {
+        self.rebalance += n;
+    }
+    pub fn get_rebalance(&self) -> i64 {
+        self.rebalance
+    }
+    pub fn inc_rebalance_time_ns(&mut self, n: i64) {
+        self.rebalance_time_ns += n;
+    }
+    pub fn get_rebalance_time_ns(&self) -> i64 {
+        self.rebalance_time_ns
+    }
+    pub fn inc_split(&mut self, n: i64) {
+        self.split += n;
+    }
+    pub fn get_split(&self) -> i64 {
+        self.split
+    }
+    pub fn inc_spill(&mut self, n: i64) {
+        self.spill += n;
+    }
+    pub fn get_spill(&self) -> i64 {
+        self.spill
+    }
+    pub fn inc_spill_time_ns(&mut self, n: i64) {
+        self.spill_time_ns += n;
+    }
+    pub fn get_spill_time_ns(&self) -> i64 {
+        self.spill_time_ns
+    }
+    pub fn inc_write(&mut self, n: i64) {
+        self.write += n;
+    }
+    pub fn get_write(&self) -> i64 {
+        self.write
+    }
+    pub fn inc_write_time_ns(&mut self, n: i64) {
+        self.write_time_ns += n;
+    }
+    pub fn get_write_time_ns(&self) -> i64 {
+        self.write_time_ns
+    }
+
     pub fn sub(&self, other: &TxStats) -> TxStats {
         TxStats {
             page_count: self.page_count - other.page_count,

@@ -97,6 +97,18 @@ impl Freelist {
         self.pending.values().map(|p| p.ids.len()).sum()
     }
 
+    /// Sorted list of all pending page ids (test / debug helper).
+    #[allow(dead_code)]
+    pub fn pending_page_ids_sorted(&self) -> Vec<Pgid> {
+        let mut ids: Vec<Pgid> = self
+            .pending
+            .values()
+            .flat_map(|p| p.ids.iter().copied())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn count(&self) -> usize {
         self.free_count() + self.pending_count()
     }
@@ -243,6 +255,20 @@ impl Freelist {
             FreelistType::Array => self.ids.clone(),
             FreelistType::HashMap => self.hashmap_free_page_ids(),
         }
+    }
+
+    #[cfg(test)]
+    fn test_set_pending(&mut self, txid: Txid, ids: Vec<Pgid>) {
+        let txp = self.pending.entry(txid).or_default();
+        txp.ids = ids.clone();
+        for id in ids {
+            self.cache.insert(id);
+        }
+    }
+
+    #[cfg(test)]
+    fn test_release_range(&mut self, begin: Txid, end: Txid) {
+        self.release_range(begin, end);
     }
 
     pub fn read_page(&mut self, page: &[u8]) {
@@ -767,5 +793,528 @@ mod tests {
         let mut f2 = Freelist::new(FreelistType::HashMap);
         f2.read_page(&buf);
         assert_eq!(f2.free_page_ids(), vec![2, 3, 4, 10]);
+    }
+
+    fn for_each_backend(f: impl Fn(FreelistType)) {
+        f(FreelistType::Array);
+        f(FreelistType::HashMap);
+    }
+
+    fn require_pages(f: &Freelist, free: &[Pgid], pending: &[Pgid]) {
+        assert_eq!(f.free_count() + f.pending_count(), f.count());
+        assert_eq!(f.free_page_ids(), free, "unexpected free pages");
+        assert_eq!(f.free_count(), free.len());
+        let pp = f.pending_page_ids_sorted();
+        assert_eq!(pp, pending, "unexpected pending pages");
+        assert_eq!(pp.len(), f.pending_count());
+        for &pgid in f.free_page_ids().iter().chain(pp.iter()) {
+            assert!(f.freed(pgid), "expected page {pgid} to be marked freed");
+        }
+    }
+
+    // Go: TestFreelist_read
+    #[test]
+    fn freelist_read() {
+        for_each_backend(|kind| {
+            let mut buf = [0u8; 4096];
+            crate::page::set_page_flags(&mut buf, crate::page::FREELIST_PAGE_FLAG);
+            crate::page::set_page_count(&mut buf, 2);
+            crate::page::write_u64(&mut buf, crate::page::PAGE_HEADER_SIZE, 23);
+            crate::page::write_u64(&mut buf, crate::page::PAGE_HEADER_SIZE + 8, 50);
+            let mut f = Freelist::new(kind);
+            f.read_page(&buf);
+            assert_eq!(f.free_page_ids(), vec![23, 50]);
+        });
+    }
+
+    // Go: TestFreelist_read_panics
+    #[test]
+    fn freelist_read_panics() {
+        for_each_backend(|kind| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut buf = [0u8; 4096];
+                crate::page::set_page_flags(&mut buf, crate::page::BRANCH_PAGE_FLAG);
+                crate::page::set_page_count(&mut buf, 2);
+                let mut f = Freelist::new(kind);
+                f.read_page(&buf);
+            }));
+            assert!(r.is_err(), "expected panic for {kind:?}");
+        });
+    }
+
+    // Go: TestFreelist_write
+    #[test]
+    fn freelist_write() {
+        for_each_backend(|kind| {
+            let mut f = Freelist::new(kind);
+            f.init(vec![12, 39]);
+            f.test_set_pending(100, vec![28, 11]);
+            f.test_set_pending(101, vec![3]);
+            let mut buf = vec![0u8; 4096];
+            f.write_page(&mut buf);
+            let mut f2 = Freelist::new(kind);
+            f2.read_page(&buf);
+            assert_eq!(f2.free_page_ids(), vec![3, 11, 12, 28, 39]);
+        });
+    }
+
+    // Go: TestFreelist_E2E_HappyPath
+    #[test]
+    fn freelist_e2e_happy_path() {
+        for_each_backend(|kind| {
+            let mut f = Freelist::new(kind);
+            f.init(vec![]);
+            require_pages(&f, &[], &[]);
+
+            assert_eq!(f.allocate(1, 5), 0);
+            f.free(2, 5, 0);
+            f.free(2, 3, 0);
+            f.free(2, 8, 0);
+            require_pages(&f, &[], &[3, 5, 8]);
+
+            f.add_readonly_txid(3);
+            f.release_pending_pages();
+            require_pages(&f, &[3, 5, 8], &[]);
+
+            assert_eq!(f.allocate(4, 2), 0);
+            let mut expected = std::collections::HashSet::from([3u64, 5, 8]);
+            for _ in 0..3 {
+                let allocated = f.allocate(4, 1);
+                assert!(expected.remove(&allocated), "unexpected pgid {allocated}");
+                assert!(!f.freed(allocated));
+            }
+            assert!(expected.is_empty());
+            assert_eq!(f.allocate(4, 1), 0);
+        });
+    }
+
+    // Go: TestFreelist_E2E_MultiSpanOverflows
+    #[test]
+    fn freelist_e2e_multi_span_overflows() {
+        for_each_backend(|kind| {
+            let mut f = Freelist::new(kind);
+            f.init(vec![]);
+            f.free(10, 20, 1);
+            f.free(10, 25, 2);
+            f.free(10, 35, 3);
+            f.free(10, 39, 2);
+            f.free(10, 45, 4);
+            require_pages(
+                &f,
+                &[],
+                &[
+                    20, 21, 25, 26, 27, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 49,
+                ],
+            );
+            f.release_pending_pages();
+            require_pages(
+                &f,
+                &[
+                    20, 21, 25, 26, 27, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 49,
+                ],
+                &[],
+            );
+
+            let alloc_sequence = [7usize, 5, 3, 2];
+            let expected_starts = [35u64, 45, 25, 20];
+            for (i, &page_nums) in alloc_sequence.iter().enumerate() {
+                let allocated = f.allocate(11, page_nums);
+                assert_eq!(allocated, expected_starts[i]);
+                for j in 0..page_nums as u64 {
+                    assert!(!f.freed(allocated + j));
+                }
+            }
+        });
+    }
+
+    // Go: TestFreelist_E2E_Rollbacks
+    #[test]
+    fn freelist_e2e_rollbacks() {
+        for_each_backend(|kind| {
+            let mut f = Freelist::new(kind);
+            f.init(vec![]);
+            f.free(2, 5, 1);
+            f.free(2, 8, 0);
+            require_pages(&f, &[], &[5, 6, 8]);
+            f.rollback(2);
+            require_pages(&f, &[], &[]);
+
+            f.free(4, 13, 3);
+            require_pages(&f, &[], &[13, 14, 15, 16]);
+            f.release_pending_pages();
+            require_pages(&f, &[13, 14, 15, 16], &[]);
+            f.rollback(1337);
+            require_pages(&f, &[13, 14, 15, 16], &[]);
+        });
+    }
+
+    // Go: TestFreelist_E2E_RollbackPanics
+    #[test]
+    fn freelist_e2e_rollback_panics() {
+        for_each_backend(|kind| {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut f = Freelist::new(kind);
+                f.init(vec![5]);
+                require_pages(&f, &[5], &[]);
+                let _ = f.allocate(5, 1);
+                f.free(5, 5, 0);
+                f.rollback(5);
+            }));
+            assert!(r.is_err(), "expected panic for {kind:?}");
+        });
+    }
+
+    // Go: TestFreelist_E2E_Reload
+    #[test]
+    fn freelist_e2e_reload() {
+        for_each_backend(|kind| {
+            let mut freelist = Freelist::new(kind);
+            freelist.init(vec![]);
+            freelist.free(2, 5, 1);
+            freelist.free(2, 8, 0);
+            freelist.release_pending_pages();
+            require_pages(&freelist, &[5, 6, 8], &[]);
+            let mut buf = vec![0u8; 4096];
+            freelist.write_page(&mut buf);
+
+            freelist.free(3, 3, 1);
+            freelist.free(3, 10, 2);
+            require_pages(&freelist, &[5, 6, 8], &[3, 4, 10, 11, 12]);
+
+            let mut other_buf = vec![0u8; 4096];
+            freelist.write_page(&mut other_buf);
+
+            let mut load_freelist = Freelist::new(kind);
+            load_freelist.init(vec![]);
+            load_freelist.read_page(&other_buf);
+            require_pages(
+                &load_freelist,
+                &[3, 4, 5, 6, 8, 10, 11, 12],
+                &[],
+            );
+            load_freelist.reload(&buf);
+            require_pages(&load_freelist, &[5, 6, 8], &[]);
+
+            let mut freelist2 = Freelist::new(kind);
+            freelist2.init(vec![]);
+            freelist2.free(5, 5, 4);
+            freelist2.reload(&buf);
+            require_pages(&freelist2, &[], &[5, 6, 7, 8, 9]);
+        });
+    }
+
+    // Go: TestFreelist_E2E_SerDe_HappyPath
+    #[test]
+    fn freelist_e2e_serde_happy_path() {
+        for_each_backend(|kind| {
+            let mut freelist = Freelist::new(kind);
+            freelist.init(vec![]);
+            freelist.free(2, 5, 1);
+            freelist.free(2, 8, 0);
+            freelist.release_pending_pages();
+            require_pages(&freelist, &[5, 6, 8], &[]);
+
+            freelist.free(3, 3, 1);
+            freelist.free(3, 10, 2);
+            require_pages(&freelist, &[5, 6, 8], &[3, 4, 10, 11, 12]);
+
+            assert_eq!(freelist.estimated_write_page_size(), 80);
+            let mut buf = vec![0u8; freelist.estimated_write_page_size()];
+            freelist.write_page(&mut buf);
+
+            let mut load_freelist = Freelist::new(kind);
+            load_freelist.init(vec![]);
+            load_freelist.read_page(&buf);
+            require_pages(
+                &load_freelist,
+                &[3, 4, 5, 6, 8, 10, 11, 12],
+                &[],
+            );
+        });
+    }
+
+    // Go: TestFreelist_E2E_SerDe_AcrossImplementations
+    #[test]
+    fn freelist_e2e_serde_across_implementations() {
+        let sizes = [0usize, 1, 10, 100, 1000, 0xFFFF, 0xFFFF + 1];
+        for &size in &sizes {
+            for kind in [FreelistType::Array, FreelistType::HashMap] {
+                let mut freelist = Freelist::new(kind);
+                let mut expected: Vec<Pgid> = Vec::new();
+                for i in 0..size {
+                    let pgid = (i + 2) as Pgid;
+                    freelist.free(1, pgid, 0);
+                    expected.push(pgid);
+                }
+                freelist.release_pending_pages();
+                require_pages(&freelist, &expected, &[]);
+                let mut buf = vec![0u8; freelist.estimated_write_page_size()];
+                freelist.write_page(&mut buf);
+                for load_kind in [FreelistType::Array, FreelistType::HashMap] {
+                    let mut load_freelist = Freelist::new(load_kind);
+                    load_freelist.read_page(&buf);
+                    require_pages(&load_freelist, &expected, &[]);
+                }
+            }
+        }
+    }
+
+    // Go: TestFreelist_E2E_SerDe_AcrossImplementations (n=0xFFFF*2) — very large; run manually.
+    #[test]
+    #[ignore = "0xFFFF*2 freelist pages is slow/memory-heavy; Go runs it in CI"]
+    fn freelist_e2e_serde_across_implementations_huge() {
+        let size = 0xFFFF * 2;
+        let mut freelist = Freelist::new(FreelistType::Array);
+        let mut expected: Vec<Pgid> = Vec::with_capacity(size);
+        for i in 0..size {
+            let pgid = (i + 2) as Pgid;
+            freelist.free(1, pgid, 0);
+            expected.push(pgid);
+        }
+        freelist.release_pending_pages();
+        let mut buf = vec![0u8; freelist.estimated_write_page_size()];
+        freelist.write_page(&mut buf);
+        let mut load_freelist = Freelist::new(FreelistType::HashMap);
+        load_freelist.read_page(&buf);
+        require_pages(&load_freelist, &expected, &[]);
+    }
+
+    // Go: TestTxidSorting
+    #[test]
+    fn txid_sorting() {
+        for seed in 0u64..200 {
+            let mut txids: Vec<Txid> = (0..20)
+                .map(|i| seed.wrapping_mul(31).wrapping_add(i * 17) % 1000)
+                .collect();
+            txids.sort_unstable();
+            for w in txids.windows(2) {
+                assert!(w[0] <= w[1], "txids not sorted: {txids:?}");
+            }
+        }
+    }
+
+    // Go: TestFreelist_releaseRange
+    #[test]
+    fn freelist_release_range_table() {
+        struct TestPage {
+            id: Pgid,
+            n: usize,
+            alloc_tx: Txid,
+            free_tx: Txid,
+        }
+        struct TestRange {
+            begin: Txid,
+            end: Txid,
+        }
+        struct Case {
+            title: &'static str,
+            pages_in: &'static [TestPage],
+            release_ranges: &'static [TestRange],
+            want_free: &'static [Pgid],
+        }
+
+        let cases = [
+            Case {
+                title: "Single pending in range",
+                pages_in: &[TestPage {
+                    id: 3,
+                    n: 1,
+                    alloc_tx: 100,
+                    free_tx: 200,
+                }],
+                release_ranges: &[TestRange { begin: 1, end: 300 }],
+                want_free: &[3],
+            },
+            Case {
+                title: "Single pending with minimum end range",
+                pages_in: &[TestPage {
+                    id: 3,
+                    n: 1,
+                    alloc_tx: 100,
+                    free_tx: 200,
+                }],
+                release_ranges: &[TestRange { begin: 1, end: 200 }],
+                want_free: &[3],
+            },
+            Case {
+                title: "Single pending outsize minimum end range",
+                pages_in: &[TestPage {
+                    id: 3,
+                    n: 1,
+                    alloc_tx: 100,
+                    free_tx: 200,
+                }],
+                release_ranges: &[TestRange { begin: 1, end: 199 }],
+                want_free: &[],
+            },
+            Case {
+                title: "Single pending with minimum begin range",
+                pages_in: &[TestPage {
+                    id: 3,
+                    n: 1,
+                    alloc_tx: 100,
+                    free_tx: 200,
+                }],
+                release_ranges: &[TestRange { begin: 100, end: 300 }],
+                want_free: &[3],
+            },
+            Case {
+                title: "Single pending outside minimum begin range",
+                pages_in: &[TestPage {
+                    id: 3,
+                    n: 1,
+                    alloc_tx: 100,
+                    free_tx: 200,
+                }],
+                release_ranges: &[TestRange { begin: 101, end: 300 }],
+                want_free: &[],
+            },
+            Case {
+                title: "Single pending in minimum range",
+                pages_in: &[TestPage {
+                    id: 3,
+                    n: 1,
+                    alloc_tx: 199,
+                    free_tx: 200,
+                }],
+                release_ranges: &[TestRange { begin: 199, end: 200 }],
+                want_free: &[3],
+            },
+            Case {
+                title: "Single pending and read transaction at 199",
+                pages_in: &[TestPage {
+                    id: 3,
+                    n: 1,
+                    alloc_tx: 199,
+                    free_tx: 200,
+                }],
+                release_ranges: &[
+                    TestRange { begin: 100, end: 198 },
+                    TestRange { begin: 200, end: 300 },
+                ],
+                want_free: &[],
+            },
+            Case {
+                title: "Adjacent pending and read transactions at 199, 200",
+                pages_in: &[
+                    TestPage {
+                        id: 3,
+                        n: 1,
+                        alloc_tx: 199,
+                        free_tx: 200,
+                    },
+                    TestPage {
+                        id: 4,
+                        n: 1,
+                        alloc_tx: 200,
+                        free_tx: 201,
+                    },
+                ],
+                release_ranges: &[
+                    TestRange { begin: 100, end: 198 },
+                    TestRange { begin: 200, end: 199 },
+                    TestRange { begin: 201, end: 300 },
+                ],
+                want_free: &[],
+            },
+            Case {
+                title: "Out of order ranges",
+                pages_in: &[
+                    TestPage {
+                        id: 3,
+                        n: 1,
+                        alloc_tx: 199,
+                        free_tx: 200,
+                    },
+                    TestPage {
+                        id: 4,
+                        n: 1,
+                        alloc_tx: 200,
+                        free_tx: 201,
+                    },
+                ],
+                release_ranges: &[
+                    TestRange { begin: 201, end: 199 },
+                    TestRange { begin: 201, end: 200 },
+                    TestRange { begin: 200, end: 200 },
+                ],
+                want_free: &[],
+            },
+            Case {
+                title: "Multiple pending, read transaction at 150",
+                pages_in: &[
+                    TestPage {
+                        id: 3,
+                        n: 1,
+                        alloc_tx: 100,
+                        free_tx: 200,
+                    },
+                    TestPage {
+                        id: 4,
+                        n: 1,
+                        alloc_tx: 100,
+                        free_tx: 125,
+                    },
+                    TestPage {
+                        id: 5,
+                        n: 1,
+                        alloc_tx: 125,
+                        free_tx: 150,
+                    },
+                    TestPage {
+                        id: 6,
+                        n: 1,
+                        alloc_tx: 125,
+                        free_tx: 175,
+                    },
+                    TestPage {
+                        id: 7,
+                        n: 2,
+                        alloc_tx: 150,
+                        free_tx: 175,
+                    },
+                    TestPage {
+                        id: 9,
+                        n: 2,
+                        alloc_tx: 175,
+                        free_tx: 200,
+                    },
+                ],
+                release_ranges: &[
+                    TestRange { begin: 50, end: 149 },
+                    TestRange { begin: 151, end: 300 },
+                ],
+                want_free: &[4, 9, 10],
+            },
+        ];
+
+        for_each_backend(|kind| {
+            for c in &cases {
+                let mut f = Freelist::new(kind);
+                let mut ids = Vec::new();
+                for p in c.pages_in {
+                    for i in 0..p.n {
+                        ids.push(p.id + i as u64);
+                    }
+                }
+                f.init(ids);
+                for p in c.pages_in {
+                    let _ = f.allocate(p.alloc_tx, p.n);
+                }
+                for p in c.pages_in {
+                    f.free(p.free_tx, p.id, (p.n - 1) as u32);
+                }
+                for r in c.release_ranges {
+                    f.test_release_range(r.begin, r.end);
+                }
+                assert_eq!(
+                    f.free_page_ids(),
+                    c.want_free,
+                    "{} ({:?})",
+                    c.title,
+                    kind
+                );
+            }
+        });
     }
 }

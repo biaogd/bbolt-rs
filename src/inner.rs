@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::db::DbInner;
 use crate::error::{Error, Result};
+use crate::stats::TxStats;
 use crate::page::{
     branch_at, branch_pgid, inodes_size, leaf_at, read_inodes, write_inodes, write_meta_page,
     InBucket, Inode, Meta, PageHeader, Pgid, BUCKET_HEADER_SIZE, BUCKET_LEAF_FLAG,
@@ -80,6 +81,7 @@ pub struct TxInner {
     pub root: BucketId,
     pub hold_writer: bool,
     pub commit_handlers: Vec<Box<dyn FnOnce()>>,
+    pub stats: TxStats,
 }
 
 enum PageNode {
@@ -103,6 +105,7 @@ impl TxInner {
             root: 0,
             hold_writer: writable,
             commit_handlers: Vec::new(),
+            stats: TxStats::default(),
         }
     }
 

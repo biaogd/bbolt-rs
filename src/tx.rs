@@ -132,9 +132,9 @@ impl Tx {
         inspect_bucket(self, b"root")
     }
 
-    /// Lightweight tx stats snapshot (counters are not fully instrumented yet).
+    /// Per-transaction counter snapshot (upstream `Tx.Stats`).
     pub fn stats(&self) -> TxStats {
-        TxStats::default()
+        self.inner.borrow().stats.clone()
     }
 
     /// Write a consistent snapshot of the database to `w` (upstream `Tx.WriteTo`).
@@ -148,13 +148,15 @@ impl Tx {
         write_meta_page(&mut buf, &meta);
         // Ensure page id 0
         crate::page::set_page_id(&mut buf, 0);
-        w.write_all(&buf).map_err(|e| Error::io("<WriteTo meta0>", e))?;
+        w.write_all(&buf)
+            .map_err(|e| Error::Corrupt(format!("meta 0 copy: {e}")))?;
         n += buf.len() as u64;
 
         meta.txid = meta.txid.saturating_sub(1);
         write_meta_page(&mut buf, &meta);
         crate::page::set_page_id(&mut buf, 1);
-        w.write_all(&buf).map_err(|e| Error::io("<WriteTo meta1>", e))?;
+        w.write_all(&buf)
+            .map_err(|e| Error::Corrupt(format!("meta 1 copy: {e}")))?;
         n += buf.len() as u64;
 
         let data_offset = (page_size * 2) as u64;
@@ -167,7 +169,7 @@ impl Tx {
             platform::read_exact_at(&inner.db.file, &mut chunk[..want], off)
                 .map_err(|e| Error::io(&inner.db.path, e))?;
             w.write_all(&chunk[..want])
-                .map_err(|e| Error::io("<WriteTo data>", e))?;
+                .map_err(|e| Error::Corrupt(e.to_string()))?;
             n += want as u64;
             off += want as u64;
             remaining -= want as u64;

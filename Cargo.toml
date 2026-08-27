@@ -26,6 +26,7 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "=3.14.0"
+rand = "0.8"
 
 [lib]
 name = "bbolt"

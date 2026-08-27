@@ -787,12 +787,115 @@ fn test_bucket_stats_nested() {
     .unwrap();
 }
 
+// Go: TestBucket_Stats
+#[test]
+fn test_bucket_stats() {
+    let (_dir, db) = common::open_tmp();
+    let big_key = b"really-big-value";
+    for i in 0..500 {
+        db.update(|tx| {
+            let b = tx.create_bucket_if_not_exists(b"woojits")?;
+            b.put(format!("{i:03}").as_bytes(), format!("{i}").as_bytes())?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    let long_key_length = 10 * db.info().page_size + 17;
+    db.update(|tx| {
+        tx.bucket(b"woojits")
+            .unwrap()
+            .put(big_key, &vec![b'*'; long_key_length])?;
+        Ok(())
+    })
+    .unwrap();
+    common::must_check(&db);
+
+    db.view(|tx| {
+        let stats = tx.bucket(b"woojits").unwrap().stats();
+        let page_size = db.info().page_size;
+        if page_size == 4096 {
+            let leaf_inuse = 7 * 16
+                + 501 * 16
+                + 500 * 3
+                + big_key.len()
+                + 10
+                + 2 * 90
+                + 3 * 400
+                + long_key_length;
+            let expected = bbolt::BucketStats {
+                branch_page_n: 1,
+                branch_overflow_n: 0,
+                leaf_page_n: 7,
+                leaf_overflow_n: 10,
+                key_n: 501,
+                depth: 2,
+                branch_alloc: 4096,
+                branch_inuse: 149,
+                leaf_alloc: 69632,
+                leaf_inuse,
+                bucket_n: 1,
+                inline_bucket_n: 0,
+                inline_bucket_inuse: 0,
+            };
+            assert_eq!(stats, expected, "stats differs from Go expectations");
+        } else {
+            // Invariants when exact page layout differs.
+            assert_eq!(stats.key_n, 501);
+            assert_eq!(stats.depth, 2);
+            assert!(stats.leaf_overflow_n >= 10);
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Stats_RandomFill — moderate smoke (full Go test is long-running).
+#[test]
+fn test_bucket_stats_random_fill_smoke() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"data")?;
+        for i in 0..200u32 {
+            b.put(&i.to_le_bytes(), &[0u8; 50])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let stats = tx.bucket(b"data").unwrap().stats();
+        assert_eq!(stats.key_n, 200);
+        assert!(stats.leaf_page_n >= 1);
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestBucket_Stats_Large — moderate smoke; full Go matrix is #[ignore].
+#[test]
+#[ignore = "full Go TestBucket_Stats_Large matrix is long-running"]
+fn test_bucket_stats_large() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"data")?;
+        for i in 0..5000u32 {
+            b.put(&i.to_le_bytes(), &[0u8; 200])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let stats = tx.bucket(b"data").unwrap().stats();
+        assert_eq!(stats.key_n, 5000);
+        Ok(())
+    })
+    .unwrap();
+}
+
 // Skipped: TestBucket_Get_FromNode — same as Put+Get in same tx (covered elsewhere).
 // Skipped: TestBucket_Get_Capacity — Go slice semantics.
 // Skipped: TestDB_Put_VeryLarge — long-running stress test (testing.Short).
 // Skipped: TestBucket_Delete_FreelistOverflow — long stress test.
 // Skipped: TestBucket_DeleteBucket_Large — extended delete variant.
-// Skipped: TestBucket_Stats, TestBucket_Stats_RandomFill, TestBucket_Stats_Large — long-running.
 
 // Go: TestBucket_Put_Closed
 #[test]

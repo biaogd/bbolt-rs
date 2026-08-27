@@ -787,14 +787,149 @@ fn test_db_batch_full() {
     .unwrap();
 }
 
+// Go: TestDB_Begin_ErrDatabaseNotOpen
+#[test]
+fn test_db_begin_err_database_not_open() {
+    let (_dir, db) = common::open_tmp();
+    db.close().unwrap();
+    assert!(matches!(db.begin(false), Err(Error::DatabaseNotOpen)));
+}
+
+// Go: TestDB_BeginRW_Closed
+#[test]
+fn test_db_begin_rw_closed() {
+    let (_dir, db) = common::open_tmp();
+    db.close().unwrap();
+    assert!(matches!(db.begin(true), Err(Error::DatabaseNotOpen)));
+}
+
+// Go: TestDB_Update_Closed
+#[test]
+fn test_db_update_closed() {
+    let (_dir, db) = common::open_tmp();
+    db.close().unwrap();
+    let err = db
+        .update(|tx| {
+            tx.create_bucket(b"widgets")?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::DatabaseNotOpen));
+}
+
+// Go: TestDB_Update_Panic
+#[test]
+fn test_db_update_panic() {
+    let (_dir, db) = common::open_tmp();
+    let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: bbolt::Result<()> = db.update(|tx| {
+            tx.create_bucket(b"widgets")?;
+            panic!("omg");
+        });
+    }));
+    assert!(recovered.is_err());
+
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+
+    db.update(|tx| {
+        assert!(tx.bucket(b"widgets").is_some());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestDB_View_Panic
+#[test]
+fn test_db_view_panic() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+
+    let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: bbolt::Result<()> = db.view(|tx| {
+            assert!(tx.bucket(b"widgets").is_some());
+            panic!("omg");
+        });
+    }));
+    assert!(recovered.is_err());
+
+    db.view(|tx| {
+        assert!(tx.bucket(b"widgets").is_some());
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestDB_Batch_Panic
+#[test]
+fn test_db_batch_panic() {
+    let (_dir, db) = common::open_tmp();
+    db.set_max_batch_size(1);
+    let sentinel = 42usize;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.batch(move |_tx| {
+            panic!("{sentinel}");
+        })
+        .unwrap();
+    }));
+    assert!(result.is_err());
+}
+
+// Go: TestDB_Close_PendingTx_RW
+#[test]
+fn test_db_close_pending_tx_rw() {
+    test_db_close_pending_tx(true);
+}
+
+// Go: TestDB_Close_PendingTx_RO — Rust close does not block on open read-only txs (no writer lock held).
+#[test]
+#[ignore = "close does not wait for open read-only transactions (differs from Go)"]
+fn test_db_close_pending_tx_ro() {
+    test_db_close_pending_tx(false);
+}
+
+fn test_db_close_pending_tx(writable: bool) {
+    let (_dir, db) = common::open_tmp();
+    let tx = db.begin(writable).unwrap();
+
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let db2 = db.clone();
+    std::thread::spawn(move || {
+        start_tx.send(()).unwrap();
+        done_tx.send(db2.close()).unwrap();
+    });
+    start_rx.recv().unwrap();
+
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(done_rx.try_recv().is_err(), "database closed too early");
+
+    if writable {
+        tx.commit().unwrap();
+    } else {
+        tx.rollback().unwrap();
+    }
+
+    match done_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("close error: {e}"),
+        Err(_) => panic!("database did not close"),
+    }
+}
+
 // Skipped: TestOpen_ReadPageSize_* — meta fallback page-size tests.
 // Skipped: TestOpen_MetaInitWriteError — pending upstream.
 // Skipped: TestOpen_FileTooSmall — truncated file error string differs.
 // Skipped: TestDB_Concurrent_WriteTo_and_ConsistentRead — heavy concurrency stress.
-// Skipped: TestDB_Begin_ErrDatabaseNotOpen — zero-value Db not exposed the same way.
-// Skipped: TestDB_BeginRW_Closed, TestDB_Close_PendingTx_* — close/pending tx timing.
-// Skipped: TestDB_Update_Closed, TestDB_Update_Panic, TestDB_View_Panic — panic/closed DB.
-// Skipped: TestDB_Batch_Panic, TestDB_BatchTime — batch edge cases.
+// Skipped: TestDB_BatchTime — batch timer edge case (covered by batch_full).
 // Skipped: TestDBUnmap — whitebox field inspection.
 // Skipped: TestDB_MaxSizeExceededCanOpenWithHighMmap — secondary max-size mmap scenario.
 // Skipped: TestDB_MaxSizeExceededDoesNotGrow, TestDB_WindowsMMapReadsAndWritesWithMaxSize —

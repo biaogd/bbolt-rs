@@ -29,30 +29,37 @@ Core operations and most of the public Go surface are implemented with on-disk f
 
 - **Windows**: flock / fdatasync / truncate-for-mmap implemented behind `cfg(windows)` but **not tested** on this Linux agent.
 - **`MmapFlags` / `Mlock`**: fields exist for API parity; memmap2 mapping does not apply arbitrary Linux `MAP_*` flags or `mlock`.
-- **Logger / StrictMode / full TxStats instrumentation**: not ported (StrictMode can be approximated by calling `tx.check()` yourself). `OnCommit` is supported.
+- **Logger / StrictMode / full TxStats instrumentation**: TxStats Inc/Get API is ported; per-tx counters are stored on `TxInner` but not yet incremented on every spill/rebalance path. `OnCommit` is supported.
 - **Surgery / bench CLI subcommands**: not included (upstream-only maintenance tools).
 - Keys/values are returned as owned `Vec<u8>` (copied out of the mmap), not zero-copy slices.
 
 ## Upstream test suite coverage
 
-Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate maps **~186** of those names via `// Go: TestX` comments (grep `Go:`), including **173/223** tests from the priority library files. `cargo test` runs **208** tests by default (**12** large simulations are `#[ignore]`).
+Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate maps **~215** of those names via `// Go: TestX` comments (grep `Go:`), including freelist E2E/SerDe, TxStats, Copy failWriter, releaseRange, QuickCheck, panic lifecycle, and bucket stats stress. `cargo test` runs **237** tests by default (**16** are `#[ignore]`).
 
 | Upstream file | Status |
 | --- | --- |
-| `db_test.go` | Most portable cases in `tests/db_test.rs` (open errors, size, batch-full, max-size reopen, concurrent WriteTo) |
-| `bucket_test.go` | Most portable cases + `Bucket::stats()` Empty/Small/Nested; closed-tx Put/Delete/ForEach/NextSequence |
-| `tx_test.go` | Closed-tx errors, CopyFile, OnCommit, `TxStats::sub` |
-| `cursor_test.go` | Seek/delete/iterate, seek-large, leaf-root-reverse, empty-page skips, `cursor.bucket()` |
+| `db_test.go` | Most portable cases + panic lifecycle, close-pending-RW, batch panic, max-size reopen, concurrent WriteTo |
+| `bucket_test.go` | Most portable cases + `Bucket::stats()` Empty/Small/Nested/**Stats(4096)**; closed-tx Put/Delete/ForEach/NextSequence |
+| `tx_test.go` | CopyFile, OnCommit, `TxStats`, failWriter Copy errors, `releaseRange`, closed-tx errors |
+| `cursor_test.go` | Seek/delete/iterate, seek-large, QuickCheck (forward/reverse/buckets), empty-page skips |
 | `movebucket_test.go` | Full table + DiffDB/DiffTx |
 | `tx_check_test.go` | Nest-bucket + corrupt page |
 | `concurrent_test.go` | Repeatable-read + generic R/W (simplified) |
 | `simulation_test.go` / `simulation_no_freelist_sync_test.go` | Through 1000op/10p (+ nfs 100op_10p); 100op_100p and 10000op monsters `#[ignore]` |
-| `internal/freelist/*_test.go` | Unit tests in `src/freelist.rs` (allocate/free/release/reload/write/read/rollback/init panics) |
+| `internal/freelist/*_test.go` | Unit tests in `src/freelist.rs` including E2E happy path, SerDe across backends, `releaseRange` table |
 | `internal/common/page_test.go` | `page_type_names`, `merge_pgids` / `merge_pgids_quick` |
 | `node_test.go` | Leaf read/write + split MinKeys/SinglePage via bucket fills |
 | `db_whitebox_test.go` | PreLoadFreelist (+ allocate growth) |
 | `cmd/bbolt/command/*_test.go` | Smoke: version/info/buckets/keys/get/check/compact/pages/inspect/stats + no-args failures |
-| failpoint / dmflakey / powerfailure / surgeon / Windows-only / QuickCheck / multi-GB | **Skipped** (environment or extreme runtime) |
+| failpoint / dmflakey / powerfailure / surgeon / Windows-only / multi-GB | **Skipped** (environment or extreme runtime) |
+
+**Still `#[ignore]` / skipped (with reason):**
+- `TestFreelist_E2E_SerDe_AcrossImplementations` at `n=0xFFFF*2` — memory/slow
+- `TestTx_TruncateBeforeWrite` — Rust `grow_size` stepping differs on Unix
+- `TestDB_Close_PendingTx_RO` — close does not block on open read-only txs
+- `TestBucket_Stats_Large` — full Go matrix is long-running
+- Simulation monsters (`100op_100p`, `10000op_*`) — runtime
 
 Also: `tests/integration.rs` (format compatibility + feature smoke).
 

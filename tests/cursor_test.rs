@@ -348,4 +348,151 @@ fn test_cursor_bucket() {
 }
 
 // Skipped: TestCursor_RepeatOperations — full 1000-key repeat next/prev cycle.
-// Skipped: TestCursor_QuickCheck* — property/quick tests.
+
+use rand::Rng;
+use std::collections::HashSet;
+
+fn quick_check_items(rng: &mut impl Rng, max_items: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let n = rng.gen_range(1..max_items);
+    let mut items = Vec::with_capacity(n);
+    let mut used = HashSet::new();
+    for _ in 0..n {
+        loop {
+            let klen = rng.gen_range(1..32);
+            let key: Vec<u8> = (0..klen).map(|_| rng.gen()).collect();
+            if used.insert(key.clone()) {
+                let vlen = rng.gen_range(0..64);
+                let val: Vec<u8> = (0..vlen).map(|_| rng.gen()).collect();
+                items.push((key, val));
+                break;
+            }
+        }
+    }
+    items
+}
+
+// Go: TestCursor_QuickCheck
+#[test]
+fn test_cursor_quick_check() {
+    let mut rng = rand::thread_rng();
+    for _ in 0..100 {
+        let items = quick_check_items(&mut rng, 50);
+        let (_dir, db) = common::open_tmp();
+        db.update(|tx| {
+            let b = tx.create_bucket(b"widgets")?;
+            for (k, v) in &items {
+                b.put(k, v)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let mut sorted = items.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        db.view(|tx| {
+            let mut c = tx.bucket(b"widgets").unwrap().cursor();
+            let mut index = 0;
+            let mut kv = c.first().unwrap();
+            while kv.0.is_some() && index < sorted.len() {
+                assert_eq!(kv.0.as_deref(), Some(sorted[index].0.as_slice()));
+                assert_eq!(kv.1.as_deref(), Some(sorted[index].1.as_slice()));
+                index += 1;
+                kv = c.next().unwrap();
+            }
+            assert_eq!(index, sorted.len());
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+// Go: TestCursor_QuickCheck_Reverse
+#[test]
+fn test_cursor_quick_check_reverse() {
+    let mut rng = rand::thread_rng();
+    for _ in 0..100 {
+        let items = quick_check_items(&mut rng, 50);
+        let (_dir, db) = common::open_tmp();
+        db.update(|tx| {
+            let b = tx.create_bucket(b"widgets")?;
+            for (k, v) in &items {
+                b.put(k, v)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let mut sorted = items.clone();
+        sorted.sort_by(|a, b| b.0.cmp(&a.0));
+
+        db.view(|tx| {
+            let mut c = tx.bucket(b"widgets").unwrap().cursor();
+            let mut index = 0;
+            let mut kv = c.last().unwrap();
+            while kv.0.is_some() && index < sorted.len() {
+                assert_eq!(kv.0.as_deref(), Some(sorted[index].0.as_slice()));
+                assert_eq!(kv.1.as_deref(), Some(sorted[index].1.as_slice()));
+                index += 1;
+                kv = c.prev().unwrap();
+            }
+            assert_eq!(index, sorted.len());
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+// Go: TestCursor_QuickCheck_BucketsOnly
+#[test]
+fn test_cursor_quick_check_buckets_only() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.create_bucket(b"foo")?;
+        b.create_bucket(b"bar")?;
+        b.create_bucket(b"baz")?;
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let mut names = Vec::new();
+        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut kv = c.first().unwrap();
+        while let Some(k) = kv.0 {
+            names.push(String::from_utf8(k).unwrap());
+            assert!(kv.1.is_none());
+            kv = c.next().unwrap();
+        }
+        assert_eq!(names, vec!["bar", "baz", "foo"]);
+        Ok(())
+    })
+    .unwrap();
+}
+
+// Go: TestCursor_QuickCheck_BucketsOnly_Reverse
+#[test]
+fn test_cursor_quick_check_buckets_only_reverse() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.create_bucket(b"foo")?;
+        b.create_bucket(b"bar")?;
+        b.create_bucket(b"baz")?;
+        Ok(())
+    })
+    .unwrap();
+    db.view(|tx| {
+        let mut names = Vec::new();
+        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut kv = c.last().unwrap();
+        while let Some(k) = kv.0 {
+            names.push(String::from_utf8(k).unwrap());
+            assert!(kv.1.is_none());
+            kv = c.prev().unwrap();
+        }
+        assert_eq!(names, vec!["foo", "baz", "bar"]);
+        Ok(())
+    })
+    .unwrap();
+}
