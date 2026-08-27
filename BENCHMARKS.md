@@ -85,3 +85,28 @@ Page-element decoding still uses the existing small `unsafe` blocks in `leaf_at`
 - Same fsync policy on both sides (`NoSync` only on `_nosync` rows).
 - Cursor scan harness still materializes key views each step (equivalent to Go using the returned `k`).
 - Get workload uses real lookups (`has_value` / Go `Get != nil`), not a stub.
+
+## vs ambaxter/bbolt-rs 1.3.10
+
+Same VM, same workloads as above (`n=100000`, key=8, value=32, page_size=4096, fsync ON, fill 0.5). Method: 1 warmup + 5 trials, **median** by `elapsed_ns`.
+
+| Side | Implementation |
+| --- | --- |
+| Go | `go.etcd.io/bbolt` **v1.5.0** (`/tmp/go-bench` from `benches/go`) |
+| this crate | `./target/release/bench_compare` (`RUSTFLAGS=-C target-cpu=native`, LTO) |
+| bbolt-rs | crates.io **`bbolt-rs` 1.3.10** via throwaway harness `/tmp/cmp-bbolt-rs` (not a dependency of this crate; built with rustc 1.85 + `target-cpu=native`) |
+
+**Caveat:** ambaxter/bbolt-rs targets the **Bolt v1.3.10** on-disk format; this crate targets **bbolt v1.5.0**. Do **not** interchange DB files across implementations — this is an API-workload comparison only.
+
+| Workload | Go ops/s | this crate | bbolt-rs | this/Go | bbolt-rs/Go | this/bbolt-rs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| seq_put | 846,040 | 2,183,226 | 1,223,120 | **2.58** | 1.45 | **1.78** |
+| random_put | 4,865 | 51,332 | 24,820 | **10.55** | 5.10 | **2.07** |
+| cursor_scan | 83,133,812 | 100,702,399 | 97,322,654 | **1.21** | 1.17 | **1.03** |
+| random_get | 2,592,914 | 3,252,083 | 2,110,585 | **1.25** | 0.81 | **1.54** |
+| deletes | 2,907,090 | 6,414,485 | 3,130,763 | **2.21** | 1.08 | **2.05** |
+
+Notes:
+
+- bbolt-rs harness uses their public API (`BoltOptions::builder`, `update`/`view`, `iter_entries`, `get`, `delete`) — not their upstream `src/bin/bench.rs` 1-second loop.
+- All three completed without panics on this machine; raw trial lines live under `bench-data/three-way/raw.tsv` (local capture, not required to reproduce).
