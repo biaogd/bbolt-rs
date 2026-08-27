@@ -135,7 +135,7 @@ Integration coverage includes create/open, put/get/delete, nested buckets, curso
 
 ## Performance vs Go bbolt
 
-See **[BENCHMARKS.md](BENCHMARKS.md)** for an apples-to-apples comparison against `go.etcd.io/bbolt` v1.5.0 on this VM (same page size, freelist array, fsync defaults). Summary: Rust is **ahead** on sequential put (~1.5×), cursor scan (~1.3×), random get (~1.3×), and random put (~5×); `many_small_tx` stays fsync-bound (~0.8×); deletes still lag (~0.45×).
+See **[BENCHMARKS.md](BENCHMARKS.md)** for an apples-to-apples comparison against `go.etcd.io/bbolt` v1.5.0 on this VM (same page size, freelist array, fsync defaults). Summary: Rust is **ahead** on seq_put (~1.4×), cursor_scan (~1.2×), random_get (~1.2×), deletes (~1.4×), and random_put (~10×); `many_small_tx` stays fsync-bound (~0.8×).
 
 ```sh
 ./benches/run_compare.sh
