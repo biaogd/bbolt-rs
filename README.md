@@ -22,7 +22,7 @@ Core operations and most of the public Go surface are implemented with on-disk f
 | `Tx.WriteTo` / `Copy` / `CopyFile` | Snapshot backup |
 | `Compact` | Library + CLI |
 | `Tx.Check` | Consistency checker |
-| `Tx.Inspect`, `Db.Stats`, `Db.Info` | |
+| `Tx.Inspect`, `Db.Stats`, `Db.Info`, `Bucket.Stats` | |
 | CLI | `bbolt` binary: `version`, `info`, `buckets`, `keys`, `get`, `check`, `compact`, `pages`, `inspect`, `stats` |
 
 ### Remaining gaps / environment limits
@@ -39,17 +39,18 @@ Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate por
 
 | Upstream file | Status |
 | --- | --- |
-| `db_test.go` | Majority of portable cases in `tests/db_test.rs` |
-| `bucket_test.go` | Majority in `tests/bucket_test.rs` (bucket Stats API not ported) |
-| `tx_test.go` | Majority in `tests/tx_test.rs` including `OnCommit` |
-| `cursor_test.go` | Core seek/delete/iterate in `tests/cursor_test.rs` |
+| `db_test.go` | Portable cases in `tests/db_test.rs` including open errors, size growth, batch-full, max-size reopen |
+| `bucket_test.go` | Portable cases in `tests/bucket_test.rs` including `Bucket::stats()` (Empty/Small/Nested) |
+| `tx_test.go` | Portable cases in `tests/tx_test.rs` including closed-tx errors and `TxStats::sub` |
+| `cursor_test.go` | Seek/delete/iterate plus seek-large, leaf-root-reverse, empty-page skips, `cursor.bucket()` |
 | `movebucket_test.go` | `tests/movebucket_test.rs` |
 | `tx_check_test.go` | `tests/tx_check_test.rs` |
 | `concurrent_test.go` | Simplified in `tests/concurrent_test.rs` |
-| `simulation_test.go` / `simulation_no_freelist_sync_test.go` | Smaller op counts in `tests/simulation_test.rs`; 10000op monsters `#[ignore]` |
-| `internal/freelist/*_test.go` | Unit tests in `src/freelist.rs` |
+| `simulation_test.go` / `simulation_no_freelist_sync_test.go` | Through 1000op/10p in `tests/simulation_test.rs`; `100op_100p` and 10000op monsters `#[ignore]` |
+| `internal/freelist/*_test.go` | Unit tests in `src/freelist.rs` (including `free_freelist_alloctx`) |
 | `internal/common/page_test.go` | Covered in `src/page.rs` (`page_type_names`, `merge_pgids_*`) |
-| `cmd/bbolt/command/*_test.go` | Smoke coverage in `tests/cli_test.rs` |
+| `node_test.go` | Leaf page read + split paths via `tests/node_test.rs` (node internals unexported) |
+| `cmd/bbolt/command/*_test.go` | Smoke coverage in `tests/cli_test.rs` (`keys`, `pages`, `inspect`, `stats`, …) |
 | failpoint / dmflakey / powerfailure / surgeon / Windows-only | **Skipped** (environment) |
 
 Also: `tests/integration.rs` (format compatibility + feature smoke).
