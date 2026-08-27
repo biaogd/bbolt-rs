@@ -1557,6 +1557,9 @@ impl TxInner {
         if self.managed {
             return Err(Error::ManagedTx);
         }
+        if self.closed {
+            return Err(Error::TxClosed);
+        }
         self.rollback_internal();
         Ok(())
     }

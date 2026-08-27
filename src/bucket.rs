@@ -125,6 +125,13 @@ impl Bucket {
     }
 
     pub fn move_bucket(&self, key: &[u8], dst: &Bucket) -> Result<()> {
+        if !self.same_db(dst) {
+            return Err(crate::error::Error::DifferentDb);
+        }
         self.tx.borrow_mut().move_bucket(self.id, dst.id, key)
+    }
+
+    pub(crate) fn same_db(&self, other: &Bucket) -> bool {
+        std::sync::Arc::ptr_eq(&self.tx.borrow().db, &other.tx.borrow().db)
     }
 }

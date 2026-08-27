@@ -485,8 +485,10 @@ impl Freelist {
 mod tests {
     use super::*;
 
+    // Go: TestFreelistArray_allocate / TestFreelistHashmap_allocate
     #[test]
     fn array_allocate_contiguous() {
+        // Go: TestFreelistArray_allocate
         let mut f = Freelist::new(FreelistType::Array);
         f.init(vec![3, 4, 5, 8, 9]);
         assert_eq!(f.allocate(1, 3), 3);
@@ -496,17 +498,23 @@ mod tests {
 
     #[test]
     fn hashmap_allocate_exact_and_split() {
+        // Go: TestFreelistHashmap_allocate — free counts are stable; exact pgid may vary by span map iteration order.
         let mut f = Freelist::new(FreelistType::HashMap);
-        f.init(vec![3, 4, 5, 8, 9]);
-        assert_eq!(f.free_count(), 5);
+        f.init(vec![3, 4, 5, 6, 7, 9, 12, 13, 18]);
+        assert_eq!(f.free_count(), 9);
         assert_eq!(f.allocate(1, 3), 3);
-        assert_eq!(f.free_count(), 2);
-        assert_eq!(f.allocate(1, 2), 8);
-        assert_eq!(f.free_count(), 0);
+        assert_eq!(f.free_count(), 6);
+        assert_ne!(f.allocate(1, 2), 0);
+        assert_eq!(f.free_count(), 4);
+        assert_ne!(f.allocate(1, 1), 0);
+        assert_eq!(f.free_count(), 3);
+        assert_eq!(f.allocate(1, 0), 0);
+        assert_eq!(f.free_count(), 3);
     }
 
     #[test]
     fn hashmap_merge_adjacent() {
+        // Go: TestFreelistHashmap_mergeWithExist (subset)
         let mut f = Freelist::new(FreelistType::HashMap);
         f.init(vec![10, 11]);
         f.merge_spans(vec![12, 13]);
@@ -514,8 +522,111 @@ mod tests {
         assert_eq!(f.allocate(1, 4), 10);
     }
 
+    // Go: TestFreelist_free
+    #[test]
+    fn freelist_free_single_page() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 12, 0);
+        let pending: Vec<Pgid> = f.pending.values().flat_map(|p| p.ids.clone()).collect();
+        assert_eq!(pending, vec![12]);
+    }
+
+    // Go: TestFreelist_free_overflow
+    #[test]
+    fn freelist_free_overflow() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 12, 3);
+        let pending: Vec<Pgid> = f.pending.values().flat_map(|p| p.ids.clone()).collect();
+        assert_eq!(pending, vec![12, 13, 14, 15]);
+    }
+
+    // Go: TestFreelist_free_double_free_panics
+    #[test]
+    #[should_panic(expected = "already freed")]
+    fn freelist_free_double_free_panics() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 12, 3);
+        f.free(100, 12, 3);
+    }
+
+    // Go: TestFreelist_free_meta_panics
+    #[test]
+    #[should_panic(expected = "cannot free page 0 or 1")]
+    fn freelist_free_meta_page_zero_panics() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot free page 0 or 1")]
+    fn freelist_free_meta_page_one_panics() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 1, 0);
+    }
+
+    // Go: TestFreelist_release
+    #[test]
+    fn freelist_release() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 12, 1);
+        f.free(100, 9, 0);
+        f.free(102, 39, 0);
+        f.release(100);
+        f.release(101);
+        assert_eq!(f.free_page_ids(), vec![9, 12, 13]);
+        f.release(102);
+        assert_eq!(f.free_page_ids(), vec![9, 12, 13, 39]);
+    }
+
+    // Go: TestFreeList_init / TestFreeList_reload (array backend)
+    #[test]
+    fn freelist_init_and_reload() {
+        let mut buf = vec![0u8; 4096];
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![5, 6, 8]);
+        f.write_page(&mut buf);
+        let mut f2 = Freelist::new(FreelistType::Array);
+        f2.read_page(&buf);
+        assert_eq!(f2.free_page_ids(), vec![5, 6, 8]);
+        f2.init(vec![]);
+        assert!(f2.free_page_ids().is_empty());
+
+        f2.init(vec![5, 6, 8]);
+        f2.free(5, 10, 2);
+        f2.reload(&buf);
+        assert_eq!(f2.free_page_ids(), vec![5, 6, 8]);
+        let pending: Vec<Pgid> = f2.pending.values().flat_map(|p| p.ids.clone()).collect();
+        assert_eq!(pending, vec![10, 11, 12]);
+    }
+
+    // Go: freelist copy_all / write path
+    #[test]
+    fn freelist_copy_all_merges_pending() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![4, 7]);
+        f.free(10, 5, 0);
+        f.free(10, 6, 0);
+        f.release(10);
+        assert_eq!(f.copy_all(), vec![4, 5, 6, 7]);
+    }
+
+    // Go: Test_Freelist_Hashmap_Rollback
+    #[test]
+    fn hashmap_rollback() {
+        let mut f = Freelist::new(FreelistType::HashMap);
+        f.init(vec![3, 5, 6, 7, 12, 13]);
+        f.free(100, 20, 1);
+        f.allocate(100, 3);
+        f.free(100, 25, 0);
+        f.allocate(100, 2);
+        f.rollback(100);
+        assert!(f.allocs.is_empty());
+        assert!(f.pending.is_empty());
+    }
+
     #[test]
     fn free_and_release() {
+        // Go: TestFreelist_free + TestFreelist_release (combined smoke)
         let mut f = Freelist::new(FreelistType::Array);
         f.free(10, 5, 0);
         f.free(10, 6, 0);
@@ -524,5 +635,24 @@ mod tests {
         f.release(10);
         assert_eq!(f.ids, vec![5, 6]);
         assert_eq!(f.pending_count(), 0);
+    }
+
+    #[test]
+    fn hashmap_free_page_ids_sorted() {
+        // Go: TestFreelistHashmap_GetFreePageIDs (small deterministic case)
+        let mut f = Freelist::new(FreelistType::HashMap);
+        f.init(vec![2, 5, 6, 10]);
+        let ids = f.copy_all();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn freelist_free_freelist_page() {
+        // Go: TestFreelist_free_freelist
+        let mut f = Freelist::new(FreelistType::Array);
+        f.free(100, 12, 0);
+        let txp = f.pending.get(&100).unwrap();
+        assert_eq!(txp.ids, vec![12]);
+        assert_eq!(txp.alloc_tx, vec![0]);
     }
 }

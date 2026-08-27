@@ -81,6 +81,11 @@ impl Tx {
         src: Option<&Bucket>,
         dst: Option<&Bucket>,
     ) -> Result<()> {
+        if let (Some(s), Some(d)) = (src, dst) {
+            if !s.same_db(d) {
+                return Err(Error::DifferentDb);
+            }
+        }
         let src_id: BucketId = src.map(|b| b.id).unwrap_or(0);
         let dst_id: BucketId = dst.map(|b| b.id).unwrap_or(0);
         self.inner.borrow_mut().move_bucket(src_id, dst_id, child)

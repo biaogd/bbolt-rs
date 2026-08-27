@@ -42,6 +42,9 @@ pub use db::{Db, Options};
 pub use error::{Error, Result};
 pub use freelist::FreelistType;
 pub use page::{DEFAULT_FILL_PERCENT, MAGIC, MAX_KEY_SIZE, MAX_VALUE_SIZE, VERSION};
-pub use page::{PageHeader, Pgid, Txid};
+pub use page::{
+    branch_at, leaf_at, PageHeader, Pgid, Txid, LEAF_PAGE_ELEMENT_SIZE, LEAF_PAGE_FLAG,
+    PAGE_HEADER_SIZE,
+};
 pub use stats::{BucketStructure, Info, PageInfo, Stats, TxStats};
 pub use tx::Tx;
