@@ -35,3 +35,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "bbolt"
 path = "src/bin/bbolt.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# Keep debuginfo off for fair throughput numbers vs Go -gcflags.
+

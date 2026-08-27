@@ -109,6 +109,8 @@ pub struct TxInner {
     pub stats: TxStats,
     /// Stable mmap view for this transaction (zero-copy page reads).
     pub(crate) mmap_pin: Arc<Mmap>,
+    /// Reused search stack for Get/has_value (avoids per-op Vec alloc).
+    get_stack: Vec<ElemRef>,
 }
 
 enum PageNode {
@@ -140,6 +142,7 @@ impl TxInner {
             commit_handlers: Vec::new(),
             stats: TxStats::default(),
             mmap_pin,
+            get_stack: Vec::with_capacity(16),
         }
     }
 
@@ -169,8 +172,10 @@ impl TxInner {
 
     /// Borrow a page for the duration of `f` (dirty copy or zero-copy mmap slice).
     fn with_page<R>(&self, pgid: Pgid, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
-        if let Some(p) = self.dirty.get(&pgid) {
-            return Ok(f(p));
+        if !self.dirty.is_empty() {
+            if let Some(p) = self.dirty.get(&pgid) {
+                return Ok(f(p));
+            }
         }
         Ok(f(DbInner::page_bytes(
             &self.mmap_pin,
@@ -196,8 +201,10 @@ impl TxInner {
             }
             return Ok(PageNode::Inline);
         }
-        if let Some(&id) = b.nodes_by_pgid.get(&pgid) {
-            return Ok(PageNode::Node(id));
+        if !b.nodes_by_pgid.is_empty() {
+            if let Some(&id) = b.nodes_by_pgid.get(&pgid) {
+                return Ok(PageNode::Node(id));
+            }
         }
         Ok(PageNode::Disk(pgid))
     }
@@ -287,6 +294,10 @@ impl TxInner {
         // Fast path: sequential append (common for bulk loads).
         if let Some(last) = n.inodes.last() {
             if last.key.as_slice() < old_key {
+                if n.inodes.len() == n.inodes.capacity() {
+                    // Grow in page-sized chunks to cut realloc traffic on bulk loads.
+                    n.inodes.reserve((self.db.page_size / 32).max(64));
+                }
                 n.inodes.push(Inode {
                     flags,
                     pgid,
@@ -371,7 +382,7 @@ impl TxInner {
         Ok((k, v, flags))
     }
 
-    fn search(
+    pub(crate) fn search(
         &mut self,
         bid: BucketId,
         stack: &mut Vec<ElemRef>,
@@ -469,7 +480,7 @@ impl TxInner {
         stack.last_mut().unwrap().index = index;
     }
 
-    fn ref_count(&self, bid: BucketId, r: &ElemRef) -> Result<usize> {
+    pub(crate) fn ref_count(&self, bid: BucketId, r: &ElemRef) -> Result<usize> {
         if r.count >= 0 {
             return Ok(r.count as usize);
         }
@@ -1119,54 +1130,138 @@ impl TxInner {
 
     pub fn get(&mut self, bid: BucketId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_open()?;
-        let mut stack = Vec::new();
-        let root = self.buckets[&bid].header.root;
-        self.search(bid, &mut stack, key, root)?;
-        let Some(r) = stack.last() else {
-            return Ok(None);
-        };
-        let count = self.ref_count(bid, r)?;
-        if count == 0 || r.index >= count {
-            return Ok(None);
-        }
-        if let Some(id) = r.node_id {
-            let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
-            if inode.flags & BUCKET_LEAF_FLAG != 0 || inode.key.as_slice() != key {
+        let mut stack = std::mem::take(&mut self.get_stack);
+        stack.clear();
+        let result = (|| {
+            let root = self.buckets[&bid].header.root;
+            self.search(bid, &mut stack, key, root)?;
+            let Some(r) = stack.last() else {
+                return Ok(None);
+            };
+            let count = self.ref_count(bid, r)?;
+            if count == 0 || r.index >= count {
                 return Ok(None);
             }
-            return Ok(Some(inode.value.clone()));
-        }
-        if self.buckets[&bid].header.root == 0 {
-            let page = self.buckets[&bid].inline_page.as_ref().unwrap();
-            let (flags, k, v) = leaf_at(page, r.index);
-            if flags & BUCKET_LEAF_FLAG != 0 || k != key {
-                return Ok(None);
+            if let Some(id) = r.node_id {
+                let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
+                if inode.flags & BUCKET_LEAF_FLAG != 0 || inode.key.as_slice() != key {
+                    return Ok(None);
+                }
+                return Ok(Some(inode.value.clone()));
             }
-            return Ok(Some(v.to_vec()));
-        }
-        self.with_page(r.pgid, |page| {
-            let (flags, k, v) = leaf_at(page, r.index);
-            if flags & BUCKET_LEAF_FLAG != 0 || k != key {
-                None
-            } else {
-                Some(v.to_vec())
+            if self.buckets[&bid].header.root == 0 {
+                let page = self.buckets[&bid].inline_page.as_ref().unwrap();
+                let (flags, k, v) = leaf_at(page, r.index);
+                if flags & BUCKET_LEAF_FLAG != 0 || k != key {
+                    return Ok(None);
+                }
+                return Ok(Some(v.to_vec()));
             }
-        })
+            self.with_page(r.pgid, |page| {
+                let (flags, k, v) = leaf_at(page, r.index);
+                if flags & BUCKET_LEAF_FLAG != 0 || k != key {
+                    None
+                } else {
+                    Some(v.to_vec())
+                }
+            })
+        })();
+        self.get_stack = stack;
+        result
+    }
+
+    /// Like Go `Bucket.Get(key) != nil` without allocating value bytes.
+    pub fn has_value(&mut self, bid: BucketId, key: &[u8]) -> Result<bool> {
+        self.check_open()?;
+        let mut pgid = self.buckets[&bid].header.root;
+        if pgid == 0 {
+            let page = self.buckets[&bid]
+                .inline_page
+                .as_ref()
+                .ok_or_else(|| Error::Corrupt("inline missing".into()))?;
+            return Ok(leaf_has_value(page, key));
+        }
+        loop {
+            // Prefer in-memory nodes when present (writable txs).
+            if let Some(id) = self.buckets[&bid].nodes_by_pgid.get(&pgid).copied() {
+                let n = &self.buckets[&bid].nodes[&id];
+                if n.is_leaf {
+                    let index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
+                    return Ok(index < n.inodes.len()
+                        && n.inodes[index].key.as_slice() == key
+                        && n.inodes[index].flags & BUCKET_LEAF_FLAG == 0);
+                }
+                let mut exact = false;
+                let mut index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
+                if index < n.inodes.len() && n.inodes[index].key == key {
+                    exact = true;
+                }
+                if !exact && index > 0 {
+                    index -= 1;
+                }
+                if index >= n.inodes.len() {
+                    index = n.inodes.len().saturating_sub(1);
+                }
+                pgid = n.inodes[index].pgid;
+                continue;
+            }
+            if let Some(p) = self.dirty.get(&pgid) {
+                let hdr = PageHeader::read(p);
+                if hdr.is_leaf() {
+                    return Ok(leaf_has_value(p, key));
+                }
+                pgid = search_page_index_pgid(p, key);
+                continue;
+            }
+            let page = DbInner::page_bytes(&self.mmap_pin, self.db.page_size, pgid)?;
+            let hdr = PageHeader::read(page);
+            if hdr.is_leaf() {
+                return Ok(leaf_has_value(page, key));
+            }
+            pgid = search_page_index_pgid(page, key);
+        }
     }
 
     pub fn delete(&mut self, bid: BucketId, key: &[u8]) -> Result<()> {
         self.check_writable()?;
-        let mut stack = Vec::new();
-        let (k, _, flags) = self.cursor_seek(bid, &mut stack, key)?;
-        if k.as_deref() != Some(key) {
-            return Ok(());
-        }
-        if flags & BUCKET_LEAF_FLAG != 0 {
-            return Err(Error::IncompatibleValue);
-        }
-        let nid = self.cursor_node(bid, &mut stack)?;
-        self.node_del(bid, nid, key);
-        Ok(())
+        let mut stack = std::mem::take(&mut self.get_stack);
+        stack.clear();
+        let result = (|| {
+            let root = self.buckets[&bid].header.root;
+            self.search(bid, &mut stack, key, root)?;
+            let Some(r) = stack.last().cloned() else {
+                return Ok(());
+            };
+            let count = self.ref_count(bid, &r)?;
+            if count == 0 || r.index >= count {
+                return Ok(());
+            }
+            // Verify key + not a bucket without cloning.
+            let (matches, is_bucket) = if let Some(id) = r.node_id {
+                let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
+                (inode.key.as_slice() == key, inode.flags & BUCKET_LEAF_FLAG != 0)
+            } else if self.buckets[&bid].header.root == 0 {
+                let page = self.buckets[&bid].inline_page.as_ref().unwrap();
+                let (flags, k, _) = leaf_at(page, r.index);
+                (k == key, flags & BUCKET_LEAF_FLAG != 0)
+            } else {
+                self.with_page(r.pgid, |page| {
+                    let (flags, k, _) = leaf_at(page, r.index);
+                    (k == key, flags & BUCKET_LEAF_FLAG != 0)
+                })?
+            };
+            if !matches {
+                return Ok(());
+            }
+            if is_bucket {
+                return Err(Error::IncompatibleValue);
+            }
+            let nid = self.cursor_node(bid, &mut stack)?;
+            self.node_del(bid, nid, key);
+            Ok(())
+        })();
+        self.get_stack = stack;
+        result
     }
 
     pub fn next_sequence(&mut self, bid: BucketId) -> Result<u64> {
@@ -1595,8 +1690,18 @@ impl TxInner {
                 let child_pgid = self.buckets[&bid].nodes[&nid].inodes[0].pgid;
                 let child = self.materialize_node(bid, child_pgid, Some(nid))?;
                 let (is_leaf, inodes, children) = {
-                    let c = &self.buckets[&bid].nodes[&child];
-                    (c.is_leaf, c.inodes.clone(), c.children.clone())
+                    let c = self
+                        .buckets
+                        .get_mut(&bid)
+                        .unwrap()
+                        .nodes
+                        .get_mut(&child)
+                        .unwrap();
+                    (
+                        c.is_leaf,
+                        std::mem::take(&mut c.inodes),
+                        std::mem::take(&mut c.children),
+                    )
                 };
                 {
                     let n = self
@@ -1668,7 +1773,16 @@ impl TxInner {
             let left = self.child_at(bid, parent, pindex - 1)?;
             (left, nid)
         };
-        let right_inodes = self.buckets[&bid].nodes[&right].inodes.clone();
+        let right_inodes = std::mem::take(
+            &mut self
+                .buckets
+                .get_mut(&bid)
+                .unwrap()
+                .nodes
+                .get_mut(&right)
+                .unwrap()
+                .inodes,
+        );
         for inode in &right_inodes {
             if let Some(&cid) = self.buckets[&bid].nodes_by_pgid.get(&inode.pgid) {
                 let old_parent = self.buckets[&bid].nodes[&cid].parent;
@@ -1937,8 +2051,22 @@ impl TxInner {
 
 /// Binary-search a branch page; sets stack index; returns child pgid.
 fn search_page_index(stack: &mut [ElemRef], page: &[u8], key: &[u8]) -> Pgid {
+    let (index, pgid) = branch_search(page, key);
+    stack.last_mut().unwrap().index = index;
+    pgid
+}
+
+fn search_page_index_pgid(page: &[u8], key: &[u8]) -> Pgid {
+    branch_search(page, key).1
+}
+
+#[inline(always)]
+fn branch_search(page: &[u8], key: &[u8]) -> (usize, Pgid) {
     let hdr = PageHeader::read(page);
     let count = hdr.count as usize;
+    if count == 0 {
+        return (0, 0);
+    }
     let mut exact = false;
     let mut lo = 0;
     let mut hi = count;
@@ -1959,14 +2087,10 @@ fn search_page_index(stack: &mut [ElemRef], page: &[u8], key: &[u8]) -> Pgid {
     if !exact && index > 0 {
         index -= 1;
     }
-    if count == 0 {
-        return 0;
-    }
     if index >= count {
         index = count - 1;
     }
-    stack.last_mut().unwrap().index = index;
-    branch_pgid(page, index)
+    (index, branch_pgid(page, index))
 }
 
 fn nsearch_page(stack: &mut [ElemRef], page: &[u8], key: &[u8]) {
@@ -1983,6 +2107,27 @@ fn nsearch_page(stack: &mut [ElemRef], page: &[u8], key: &[u8]) {
         }
     }
     stack.last_mut().unwrap().index = lo;
+}
+
+#[inline(always)]
+fn leaf_has_value(page: &[u8], key: &[u8]) -> bool {
+    let count = PageHeader::read(page).count as usize;
+    let mut lo = 0;
+    let mut hi = count;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let (_, k, _) = leaf_at(page, mid);
+        if k < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo >= count {
+        return false;
+    }
+    let (flags, k, _) = leaf_at(page, lo);
+    flags & BUCKET_LEAF_FLAG == 0 && k == key
 }
 
 impl Drop for TxInner {

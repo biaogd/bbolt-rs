@@ -31,7 +31,7 @@ Core operations and most of the public Go surface are implemented with on-disk f
 - **`MmapFlags` / `Mlock`**: fields exist for API parity; memmap2 mapping does not apply arbitrary Linux `MAP_*` flags or `mlock`.
 - **Logger / StrictMode / full TxStats instrumentation**: TxStats Inc/Get/`add` API is ported; per-tx counters are stored on `TxInner` but not yet incremented on every spill/rebalance path. `OnCommit` is supported.
 - **Surgery / bench CLI subcommands**: not included (upstream-only maintenance tools).
-- Keys/values are returned as owned `Vec<u8>` (copied out of the mmap), not zero-copy slices.
+- Keys/values from `get` / `Cursor::{first,next,...}` are owned `Vec<u8>`. Prefer `Cursor::{first_view,next_view,key,value}` or `Bucket::has_value` for Go-style zero-copy views into the pinned mmap.
 
 ## Upstream test suite coverage
 

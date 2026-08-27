@@ -73,6 +73,15 @@ impl Bucket {
         self.tx.borrow_mut().get(self.id, key).ok().flatten()
     }
 
+    /// Zero-copy existence check equivalent to Go `Bucket.Get(key) != nil` for values
+    /// (no heap allocation of the value bytes).
+    pub fn has_value(&self, key: &[u8]) -> bool {
+        self.tx
+            .borrow_mut()
+            .has_value(self.id, key)
+            .unwrap_or(false)
+    }
+
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.tx.borrow_mut().put(self.id, key, value)
     }

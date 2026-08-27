@@ -166,6 +166,37 @@ impl Cursor {
         Ok(self.view_valid)
     }
 
+    /// Like Go `Cursor.Seek`: positions to the given key (or next) with zero-copy views.
+    pub fn seek_view(&mut self, key: &[u8]) -> Result<bool> {
+        let ptrs = {
+            let mut inner = self.tx.borrow_mut();
+            inner.check_open()?;
+            self.mmap = Arc::clone(&inner.mmap_pin);
+            self.page_size = inner.db.page_size;
+            let root = inner.buckets[&self.bucket].header.root;
+            self.stack.clear();
+            inner.search(self.bucket, &mut self.stack, key, root)?;
+            // Go Seek moves to next if index past end of leaf.
+            if let Some(last) = self.stack.last() {
+                let count = inner.ref_count(self.bucket, last)?;
+                if last.index >= count {
+                    if !inner.cursor_next_move(self.bucket, &mut self.stack)? {
+                        None
+                    } else {
+                        inner.cursor_kv_ptrs(self.bucket, &self.stack)?
+                    }
+                } else {
+                    inner.cursor_kv_ptrs(self.bucket, &self.stack)?
+                }
+            } else {
+                None
+            }
+        };
+        self.cache_leaf_from_stack();
+        self.apply_view(ptrs);
+        Ok(self.view_valid)
+    }
+
     pub fn key(&self) -> Option<&[u8]> {
         if !self.view_valid || self.key_ptr.is_null() {
             None

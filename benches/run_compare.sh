@@ -10,6 +10,8 @@ TRIALS="${TRIALS:-5}"
 WARMUP="${WARMUP:-1}"
 GOTOOLCHAIN="${GOTOOLCHAIN:-auto}"
 export GOTOOLCHAIN
+# Match Go's host-tuned codegen on this machine (override by setting RUSTFLAGS).
+export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
 
 mkdir -p "${DATA_ROOT}"
 df -T "${DATA_ROOT}" | tee "${DATA_ROOT}/disk.txt"

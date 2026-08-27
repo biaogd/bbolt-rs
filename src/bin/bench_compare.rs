@@ -202,7 +202,8 @@ fn timed_random_get(
         let b = tx.bucket(b"bench").ok_or(bbolt::Error::BucketNotFound)?;
         for &i in &order {
             make_key(&mut key, i);
-            if b.get(&key).is_none() {
+            // Match Go `b.Get(key) == nil` (zero-copy existence; no value heap alloc).
+            if !b.has_value(&key) {
                 return Err(bbolt::Error::Invalid);
             }
         }

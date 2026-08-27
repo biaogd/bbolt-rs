@@ -284,29 +284,64 @@ pub fn set_page_overflow(buf: &mut [u8], overflow: u32) {
 #[inline(always)]
 pub fn leaf_at(page: &[u8], index: usize) -> (u32, &[u8], &[u8]) {
     let off = PAGE_HEADER_SIZE + index * LEAF_PAGE_ELEMENT_SIZE;
-    let flags = read_u32(page, off);
-    let pos = read_u32(page, off + 4) as usize;
-    let ksize = read_u32(page, off + 8) as usize;
-    let vsize = read_u32(page, off + 12) as usize;
-    let key_off = off + pos;
-    let key = &page[key_off..key_off + ksize];
-    let val = &page[key_off + ksize..key_off + ksize + vsize];
-    (flags, key, val)
+    debug_assert!(off + LEAF_PAGE_ELEMENT_SIZE <= page.len());
+    // SAFETY: callers only pass indices < page.count; element header is 16 bytes.
+    unsafe {
+        let base = page.as_ptr().add(off);
+        let flags = u32::from_le_bytes([*base, *base.add(1), *base.add(2), *base.add(3)]);
+        let pos = u32::from_le_bytes([*base.add(4), *base.add(5), *base.add(6), *base.add(7)]) as usize;
+        let ksize =
+            u32::from_le_bytes([*base.add(8), *base.add(9), *base.add(10), *base.add(11)]) as usize;
+        let vsize =
+            u32::from_le_bytes([*base.add(12), *base.add(13), *base.add(14), *base.add(15)]) as usize;
+        let key_ptr = base.add(pos);
+        let key = std::slice::from_raw_parts(key_ptr, ksize);
+        let val = std::slice::from_raw_parts(key_ptr.add(ksize), vsize);
+        (flags, key, val)
+    }
 }
 
 /// Branch element at `index`, returning (pgid, key).
+#[inline(always)]
 pub fn branch_at(page: &[u8], index: usize) -> (Pgid, &[u8]) {
     let off = PAGE_HEADER_SIZE + index * BRANCH_PAGE_ELEMENT_SIZE;
-    let pos = read_u32(page, off) as usize;
-    let ksize = read_u32(page, off + 4) as usize;
-    let pgid = read_u64(page, off + 8);
-    let key_off = off + pos;
-    (pgid, &page[key_off..key_off + ksize])
+    debug_assert!(off + BRANCH_PAGE_ELEMENT_SIZE <= page.len());
+    unsafe {
+        let base = page.as_ptr().add(off);
+        let pos = u32::from_le_bytes([*base, *base.add(1), *base.add(2), *base.add(3)]) as usize;
+        let ksize =
+            u32::from_le_bytes([*base.add(4), *base.add(5), *base.add(6), *base.add(7)]) as usize;
+        let pgid = u64::from_le_bytes([
+            *base.add(8),
+            *base.add(9),
+            *base.add(10),
+            *base.add(11),
+            *base.add(12),
+            *base.add(13),
+            *base.add(14),
+            *base.add(15),
+        ]);
+        let key = std::slice::from_raw_parts(base.add(pos), ksize);
+        (pgid, key)
+    }
 }
 
 pub fn branch_pgid(page: &[u8], index: usize) -> Pgid {
     let off = PAGE_HEADER_SIZE + index * BRANCH_PAGE_ELEMENT_SIZE;
-    read_u64(page, off + 8)
+    debug_assert!(off + BRANCH_PAGE_ELEMENT_SIZE <= page.len());
+    unsafe {
+        let base = page.as_ptr().add(off + 8);
+        u64::from_le_bytes([
+            *base,
+            *base.add(1),
+            *base.add(2),
+            *base.add(3),
+            *base.add(4),
+            *base.add(5),
+            *base.add(6),
+            *base.add(7),
+        ])
+    }
 }
 
 pub fn meta_from_page(page: &[u8]) -> Meta {
