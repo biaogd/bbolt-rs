@@ -310,9 +310,40 @@ fn test_tx_rollback() {
     .unwrap();
 }
 
+// Go: TestTx_OnCommit
+#[test]
+fn test_tx_on_commit() {
+    let (_dir, db) = common::open_tmp();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f2 = std::sync::Arc::clone(&flag);
+    db.update(|tx| {
+        tx.on_commit(move || {
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        tx.create_bucket(b"widgets")?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+// Go: TestTx_OnCommit_Rollback
+#[test]
+fn test_tx_on_commit_rollback() {
+    let (_dir, db) = common::open_tmp();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f2 = std::sync::Arc::clone(&flag);
+    let tx = db.begin(true).unwrap();
+    tx.on_commit(move || {
+        f2.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    tx.create_bucket(b"widgets").unwrap();
+    tx.rollback().unwrap();
+    assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 // Skipped: TestTx_CreateBucket_ErrTxClosed, TestTx_DeleteBucket_ErrTxClosed — stale tx handle.
 // Skipped: TestTx_Get_NotFound — bucket-level get covered in bucket tests.
-// Skipped: TestTx_OnCommit, TestTx_OnCommit_Rollback — OnCommit API not implemented.
 // Skipped: TestTx_CopyFile_Error_Meta, TestTx_CopyFile_Error_Normal — failWriter injection.
 // Skipped: TestTx_releaseRange — complex freelist releaseRange integration test.
 // Skipped: TestTxStats_GetAndIncAtomically, TestTxStats_Sub — TxStats counters not instrumented.

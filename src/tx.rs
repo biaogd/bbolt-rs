@@ -196,6 +196,14 @@ impl Tx {
         self.inner.borrow().meta.clone()
     }
 
+    /// Register a handler to run after a successful commit (upstream `Tx.OnCommit`).
+    pub fn on_commit<F>(&self, f: F)
+    where
+        F: FnOnce() + 'static,
+    {
+        self.inner.borrow_mut().commit_handlers.push(Box::new(f));
+    }
+
     /// Read a page for inspection (CLI / debugging).
     pub fn page_info(&self, id: Pgid) -> Result<crate::stats::PageInfo> {
         let inner = self.inner.borrow();

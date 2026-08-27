@@ -79,6 +79,7 @@ pub struct TxInner {
     pub next_bucket_id: BucketId,
     pub root: BucketId,
     pub hold_writer: bool,
+    pub commit_handlers: Vec<Box<dyn FnOnce()>>,
 }
 
 enum PageNode {
@@ -101,6 +102,7 @@ impl TxInner {
             next_bucket_id: 1,
             root: 0,
             hold_writer: writable,
+            commit_handlers: Vec::new(),
         }
     }
 
@@ -1512,7 +1514,11 @@ impl TxInner {
         let file_len = self.db.file_size()? as usize;
         let _ = self.db.ensure_mapped(file_len);
         *self.db.committed_meta.lock() = self.meta.clone();
+        let handlers = std::mem::take(&mut self.commit_handlers);
         self.close_internal();
+        for h in handlers {
+            h();
+        }
         Ok(())
     }
 

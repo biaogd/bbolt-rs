@@ -21,11 +21,17 @@ pub fn opts_with(mut opts: Options) -> Options {
     opts
 }
 
+/// Create a temp directory and open a new database with custom options.
+pub fn open_tmp_with(opts: Options) -> (tempfile::TempDir, Db) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Db::open(&path, 0o600, Some(opts_with(opts))).unwrap();
+    (dir, db)
+}
+
 /// Create a temp directory and open a new database (upstream `MustCreateDB`).
 pub fn open_tmp() -> (tempfile::TempDir, Db) {
-    let dir = tempfile::tempdir().unwrap();
-    let db = must_create_db_in(dir.path());
-    (dir, db)
+    open_tmp_with(default_opts())
 }
 
 pub fn db_path(dir: &tempfile::TempDir) -> PathBuf {
