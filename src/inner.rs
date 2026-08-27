@@ -3,11 +3,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use memmap2::Mmap;
+
 use crate::db::DbInner;
 use crate::error::{Error, Result};
 use crate::stats::TxStats;
 use crate::page::{
-    branch_at, branch_pgid, inodes_size, leaf_at, read_inodes, write_inodes, write_meta_page,
+    branch_at, branch_pgid, inodes_size, inodes_size_less_than, leaf_at, read_inodes, write_inodes,
+    write_meta_page,
     InBucket, Inode, Meta, PageHeader, Pgid, BUCKET_HEADER_SIZE, BUCKET_LEAF_FLAG,
     DEFAULT_FILL_PERCENT, LEAF_PAGE_FLAG, MAX_FILL_PERCENT, MAX_KEY_SIZE, MAX_VALUE_SIZE,
     MIN_FILL_PERCENT, MIN_KEYS_PER_PAGE, PAGE_HEADER_SIZE, PGID_NO_FREELIST,
@@ -67,6 +70,28 @@ pub struct ElemRef {
     pub node_id: Option<NodeId>,
     pub pgid: Pgid,
     pub index: usize,
+    /// Cached element count for this page/node (-1 = unknown).
+    pub count: i32,
+}
+
+impl ElemRef {
+    fn disk(pgid: Pgid, index: usize) -> Self {
+        Self {
+            node_id: None,
+            pgid,
+            index,
+            count: -1,
+        }
+    }
+
+    fn node(node_id: NodeId, pgid: Pgid, index: usize, count: usize) -> Self {
+        Self {
+            node_id: Some(node_id),
+            pgid,
+            index,
+            count: count as i32,
+        }
+    }
 }
 
 pub struct TxInner {
@@ -82,15 +107,23 @@ pub struct TxInner {
     pub hold_writer: bool,
     pub commit_handlers: Vec<Box<dyn FnOnce()>>,
     pub stats: TxStats,
+    /// Stable mmap view for this transaction (zero-copy page reads).
+    pub(crate) mmap_pin: Arc<Mmap>,
 }
 
 enum PageNode {
     Node(NodeId),
-    Bytes(Vec<u8>),
+    /// On-disk page; read via [`TxInner::with_page`] (no owned copy).
+    Disk(Pgid),
+    /// Inline bucket page stored in memory.
+    Inline,
 }
 
 impl TxInner {
     pub fn new(db: Arc<DbInner>, meta: Meta, writable: bool) -> Self {
+        let mmap_pin = db
+            .pin_mmap()
+            .expect("mmap must be mapped when starting a transaction");
         let mut buckets = HashMap::new();
         buckets.insert(0, BucketInner::new(meta.root));
         Self {
@@ -106,6 +139,7 @@ impl TxInner {
             hold_writer: writable,
             commit_handlers: Vec::new(),
             stats: TxStats::default(),
+            mmap_pin,
         }
     }
 
@@ -130,7 +164,25 @@ impl TxInner {
         if let Some(p) = self.dirty.get(&pgid) {
             return Ok(p.clone());
         }
-        self.db.read_page(pgid)
+        Ok(DbInner::page_bytes(&self.mmap_pin, self.db.page_size, pgid)?.to_vec())
+    }
+
+    /// Borrow a page for the duration of `f` (dirty copy or zero-copy mmap slice).
+    fn with_page<R>(&self, pgid: Pgid, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        if let Some(p) = self.dirty.get(&pgid) {
+            return Ok(f(p));
+        }
+        Ok(f(DbInner::page_bytes(
+            &self.mmap_pin,
+            self.db.page_size,
+            pgid,
+        )?))
+    }
+
+    /// Refresh the mmap pin after the file mapping may have grown.
+    pub(crate) fn refresh_mmap_pin(&mut self) -> Result<()> {
+        self.mmap_pin = self.db.pin_mmap()?;
+        Ok(())
     }
 
     fn page_node(&self, bid: BucketId, pgid: Pgid) -> Result<PageNode> {
@@ -142,16 +194,12 @@ impl TxInner {
             if let Some(id) = b.root_node {
                 return Ok(PageNode::Node(id));
             }
-            let page = b
-                .inline_page
-                .clone()
-                .ok_or_else(|| Error::Corrupt("inline bucket missing page".into()))?;
-            return Ok(PageNode::Bytes(page));
+            return Ok(PageNode::Inline);
         }
         if let Some(&id) = b.nodes_by_pgid.get(&pgid) {
             return Ok(PageNode::Node(id));
         }
-        Ok(PageNode::Bytes(self.read_page(pgid)?))
+        Ok(PageNode::Disk(pgid))
     }
 
     fn materialize_node(
@@ -236,6 +284,34 @@ impl TxInner {
             .nodes
             .get_mut(&nid)
             .unwrap();
+        // Fast path: sequential append (common for bulk loads).
+        if let Some(last) = n.inodes.last() {
+            if last.key.as_slice() < old_key {
+                n.inodes.push(Inode {
+                    flags,
+                    pgid,
+                    key: new_key.to_vec(),
+                    value: value.to_vec(),
+                });
+                return;
+            }
+            if last.key.as_slice() == old_key {
+                let inode = n.inodes.last_mut().unwrap();
+                inode.flags = flags;
+                inode.key = new_key.to_vec();
+                inode.value = value.to_vec();
+                inode.pgid = pgid;
+                return;
+            }
+        } else {
+            n.inodes.push(Inode {
+                flags,
+                pgid,
+                key: new_key.to_vec(),
+                value: value.to_vec(),
+            });
+            return;
+        }
         let index = n.inodes.partition_point(|ino| ino.key.as_slice() < old_key);
         let exact = index < n.inodes.len() && n.inodes[index].key == old_key;
         if !exact {
@@ -304,11 +380,8 @@ impl TxInner {
     ) -> Result<()> {
         match self.page_node(bid, pgid)? {
             PageNode::Node(id) => {
-                stack.push(ElemRef {
-                    node_id: Some(id),
-                    pgid,
-                    index: 0,
-                });
+                let count = self.buckets[&bid].nodes[&id].inodes.len();
+                stack.push(ElemRef::node(id, pgid, 0, count));
                 let is_leaf = self.buckets[&bid].nodes[&id].is_leaf;
                 if is_leaf {
                     self.nsearch_node(bid, stack, key, id);
@@ -316,21 +389,52 @@ impl TxInner {
                 }
                 self.search_node(bid, stack, key, id)
             }
-            PageNode::Bytes(page) => {
-                stack.push(ElemRef {
-                    node_id: None,
-                    pgid,
-                    index: 0,
-                });
-                let hdr = PageHeader::read(&page);
-                if !hdr.is_branch() && !hdr.is_leaf() {
-                    panic!("invalid page type: {}: {:x}", hdr.id, hdr.flags);
-                }
-                if hdr.is_leaf() {
-                    self.nsearch_page(stack, &page, key);
+            PageNode::Disk(pgid) => {
+                stack.push(ElemRef::disk(pgid, 0));
+                let (is_leaf, child) = {
+                    let page = if let Some(p) = self.dirty.get(&pgid) {
+                        p.as_slice()
+                    } else {
+                        DbInner::page_bytes(&self.mmap_pin, self.db.page_size, pgid)?
+                    };
+                    let hdr = PageHeader::read(page);
+                    if !hdr.is_branch() && !hdr.is_leaf() {
+                        panic!("invalid page type: {}: {:x}", hdr.id, hdr.flags);
+                    }
+                    stack.last_mut().unwrap().count = hdr.count as i32;
+                    if hdr.is_leaf() {
+                        nsearch_page(stack, page, key);
+                        (true, 0)
+                    } else {
+                        let child = search_page_index(stack, page, key);
+                        (false, child)
+                    }
+                };
+                if is_leaf {
                     return Ok(());
                 }
-                self.search_page(bid, stack, key, &page)
+                self.search(bid, stack, key, child)
+            }
+            PageNode::Inline => {
+                stack.push(ElemRef::disk(0, 0));
+                let child = {
+                    let page = self.buckets[&bid]
+                        .inline_page
+                        .as_ref()
+                        .ok_or_else(|| Error::Corrupt("inline bucket missing page".into()))?;
+                    let hdr = PageHeader::read(page);
+                    stack.last_mut().unwrap().count = hdr.count as i32;
+                    if hdr.is_leaf() {
+                        nsearch_page(stack, page, key);
+                        None
+                    } else {
+                        Some(search_page_index(stack, page, key))
+                    }
+                };
+                if let Some(child) = child {
+                    self.search(bid, stack, key, child)?;
+                }
+                Ok(())
             }
         }
     }
@@ -359,69 +463,16 @@ impl TxInner {
         self.search(bid, stack, key, child)
     }
 
-    fn search_page(
-        &mut self,
-        bid: BucketId,
-        stack: &mut Vec<ElemRef>,
-        key: &[u8],
-        page: &[u8],
-    ) -> Result<()> {
-        let hdr = PageHeader::read(page);
-        let count = hdr.count as usize;
-        let mut exact = false;
-        let mut lo = 0;
-        let mut hi = count;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let (_, k) = branch_at(page, mid);
-            match k.cmp(key) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    exact = true;
-                    lo = mid;
-                    break;
-                }
-            }
-        }
-        let mut index = lo;
-        if !exact && index > 0 {
-            index -= 1;
-        }
-        if count == 0 {
-            return Ok(());
-        }
-        if index >= count {
-            index = count - 1;
-        }
-        stack.last_mut().unwrap().index = index;
-        let child = branch_pgid(page, index);
-        self.search(bid, stack, key, child)
-    }
-
     fn nsearch_node(&self, bid: BucketId, stack: &mut [ElemRef], key: &[u8], nid: NodeId) {
         let inodes = &self.buckets[&bid].nodes[&nid].inodes;
         let index = inodes.partition_point(|ino| ino.key.as_slice() < key);
         stack.last_mut().unwrap().index = index;
     }
 
-    fn nsearch_page(&self, stack: &mut [ElemRef], page: &[u8], key: &[u8]) {
-        let count = PageHeader::read(page).count as usize;
-        let mut lo = 0;
-        let mut hi = count;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let (_, k, _) = leaf_at(page, mid);
-            if k < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        stack.last_mut().unwrap().index = lo;
-    }
-
     fn ref_count(&self, bid: BucketId, r: &ElemRef) -> Result<usize> {
+        if r.count >= 0 {
+            return Ok(r.count as usize);
+        }
         if let Some(id) = r.node_id {
             Ok(self.buckets[&bid].nodes[&id].inodes.len())
         } else if self.buckets[&bid].header.root == 0 {
@@ -431,9 +482,17 @@ impl TxInner {
                 .ok_or_else(|| Error::Corrupt("inline missing".into()))?;
             Ok(PageHeader::read(page).count as usize)
         } else {
-            let page = self.read_page(r.pgid)?;
-            Ok(PageHeader::read(&page).count as usize)
+            self.with_page(r.pgid, |page| PageHeader::read(page).count as usize)
         }
+    }
+
+    fn fill_ref_count(&self, bid: BucketId, r: &mut ElemRef) -> Result<usize> {
+        if r.count >= 0 {
+            return Ok(r.count as usize);
+        }
+        let c = self.ref_count(bid, r)?;
+        r.count = c as i32;
+        Ok(c)
     }
 
     fn ref_is_leaf(&self, bid: BucketId, r: &ElemRef) -> Result<bool> {
@@ -443,45 +502,68 @@ impl TxInner {
             let page = self.buckets[&bid].inline_page.as_ref().unwrap();
             Ok(PageHeader::read(page).is_leaf())
         } else {
-            let page = self.read_page(r.pgid)?;
-            Ok(PageHeader::read(&page).is_leaf())
+            self.with_page(r.pgid, |page| PageHeader::read(page).is_leaf())
         }
     }
 
     pub fn key_value(&self, bid: BucketId, stack: &[ElemRef]) -> Result<Kv> {
-        let Some(r) = stack.last() else {
+        let mut kbuf = Vec::new();
+        let mut vbuf = Vec::new();
+        let (ok, flags, has_val) = self.key_value_into(bid, stack, &mut kbuf, &mut vbuf)?;
+        if !ok {
             return Ok((None, None, 0));
+        }
+        let v = if has_val { Some(vbuf) } else { None };
+        Ok((Some(kbuf), v, flags))
+    }
+
+    /// Copy current cursor KV into caller buffers (avoids intermediate allocations).
+    /// Returns `(present, flags, has_value)`.
+    pub fn key_value_into(
+        &self,
+        bid: BucketId,
+        stack: &[ElemRef],
+        key_buf: &mut Vec<u8>,
+        val_buf: &mut Vec<u8>,
+    ) -> Result<(bool, u32, bool)> {
+        key_buf.clear();
+        val_buf.clear();
+        let Some(r) = stack.last() else {
+            return Ok((false, 0, false));
         };
         let count = self.ref_count(bid, r)?;
         if count == 0 || r.index >= count {
-            return Ok((None, None, 0));
+            return Ok((false, 0, false));
         }
         if let Some(id) = r.node_id {
             let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
             let flags = inode.flags;
-            let k = Some(inode.key.clone());
-            let v = if flags & BUCKET_LEAF_FLAG != 0 {
-                None
-            } else {
-                Some(inode.value.clone())
-            };
-            return Ok((k, v, flags));
+            key_buf.extend_from_slice(&inode.key);
+            let has_val = flags & BUCKET_LEAF_FLAG == 0;
+            if has_val {
+                val_buf.extend_from_slice(&inode.value);
+            }
+            return Ok((true, flags, has_val));
         }
-        let page;
-        let page_ref: &[u8] = if self.buckets[&bid].header.root == 0 {
-            self.buckets[&bid].inline_page.as_ref().unwrap()
-        } else {
-            page = self.read_page(r.pgid)?;
-            &page
-        };
-        let (flags, key, val) = leaf_at(page_ref, r.index);
-        let k = Some(key.to_vec());
-        let v = if flags & BUCKET_LEAF_FLAG != 0 {
-            None
-        } else {
-            Some(val.to_vec())
-        };
-        Ok((k, v, flags))
+        if self.buckets[&bid].header.root == 0 {
+            let page_ref = self.buckets[&bid].inline_page.as_ref().unwrap();
+            let (flags, key, val) = leaf_at(page_ref, r.index);
+            key_buf.extend_from_slice(key);
+            let has_val = flags & BUCKET_LEAF_FLAG == 0;
+            if has_val {
+                val_buf.extend_from_slice(val);
+            }
+            return Ok((true, flags, has_val));
+        }
+        self.with_page(r.pgid, |page_ref| {
+            let (flags, key, val) = leaf_at(page_ref, r.index);
+            key_buf.extend_from_slice(key);
+            let has_val = flags & BUCKET_LEAF_FLAG == 0;
+            if has_val {
+                val_buf.extend_from_slice(val);
+            }
+            (true, flags, has_val)
+        })
     }
 
     /// Raw key/value including bucket payload (for open_bucket).
@@ -501,18 +583,65 @@ impl TxInner {
                 inode.flags,
             ));
         }
-        let page;
-        let page_ref: &[u8] = if self.buckets[&bid].header.root == 0 {
-            self.buckets[&bid].inline_page.as_ref().unwrap()
-        } else {
-            page = self.read_page(r.pgid)?;
-            &page
-        };
-        let (flags, key, val) = leaf_at(page_ref, r.index);
-        Ok((Some(key.to_vec()), Some(val.to_vec()), flags))
+        if self.buckets[&bid].header.root == 0 {
+            let page_ref = self.buckets[&bid].inline_page.as_ref().unwrap();
+            let (flags, key, val) = leaf_at(page_ref, r.index);
+            return Ok((Some(key.to_vec()), Some(val.to_vec()), flags));
+        }
+        self.with_page(r.pgid, |page_ref| {
+            let (flags, key, val) = leaf_at(page_ref, r.index);
+            (Some(key.to_vec()), Some(val.to_vec()), flags)
+        })
     }
 
-    fn go_to_first(&mut self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<()> {
+    /// Zero-copy key/value pointers for the current stack position (Go Cursor semantics).
+    /// Pointers remain valid until the next structural mutation or transaction close.
+    pub fn cursor_kv_ptrs(
+        &self,
+        bid: BucketId,
+        stack: &[ElemRef],
+    ) -> Result<Option<(*const u8, usize, *const u8, usize, u32)>> {
+        let Some(r) = stack.last() else {
+            return Ok(None);
+        };
+        let count = self.ref_count(bid, r)?;
+        if count == 0 || r.index >= count {
+            return Ok(None);
+        }
+        if let Some(id) = r.node_id {
+            let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
+            return Ok(Some((
+                inode.key.as_ptr(),
+                inode.key.len(),
+                inode.value.as_ptr(),
+                inode.value.len(),
+                inode.flags,
+            )));
+        }
+        if self.buckets[&bid].header.root == 0 {
+            let page_ref = self.buckets[&bid].inline_page.as_ref().unwrap();
+            let (flags, key, val) = leaf_at(page_ref, r.index);
+            return Ok(Some((
+                key.as_ptr(),
+                key.len(),
+                val.as_ptr(),
+                val.len(),
+                flags,
+            )));
+        }
+        self.with_page(r.pgid, |page_ref| {
+            let (flags, key, val) = leaf_at(page_ref, r.index);
+            Some((
+                key.as_ptr(),
+                key.len(),
+                val.as_ptr(),
+                val.len(),
+                flags,
+            ))
+        })
+    }
+
+    fn go_to_first(&self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<()> {
         loop {
             let last = stack.last().cloned().unwrap();
             if self.ref_is_leaf(bid, &last)? {
@@ -520,16 +649,26 @@ impl TxInner {
             }
             let pgid = self.child_pgid(bid, &last)?;
             match self.page_node(bid, pgid)? {
-                PageNode::Node(id) => stack.push(ElemRef {
-                    node_id: Some(id),
-                    pgid,
-                    index: 0,
-                }),
-                PageNode::Bytes(_) => stack.push(ElemRef {
-                    node_id: None,
-                    pgid,
-                    index: 0,
-                }),
+                PageNode::Node(id) => {
+                    let count = self.buckets[&bid].nodes[&id].inodes.len();
+                    stack.push(ElemRef::node(id, pgid, 0, count));
+                }
+                PageNode::Disk(pgid) => {
+                    let count = self.with_page(pgid, |page| PageHeader::read(page).count as i32)?;
+                    let mut er = ElemRef::disk(pgid, 0);
+                    er.count = count;
+                    stack.push(er);
+                }
+                PageNode::Inline => {
+                    let count = self.buckets[&bid]
+                        .inline_page
+                        .as_ref()
+                        .map(|p| PageHeader::read(p).count as i32)
+                        .unwrap_or(0);
+                    let mut er = ElemRef::disk(0, 0);
+                    er.count = count;
+                    stack.push(er);
+                }
             }
         }
         Ok(())
@@ -538,39 +677,55 @@ impl TxInner {
     fn child_pgid(&self, bid: BucketId, r: &ElemRef) -> Result<Pgid> {
         if let Some(id) = r.node_id {
             Ok(self.buckets[&bid].nodes[&id].inodes[r.index].pgid)
+        } else if self.buckets[&bid].header.root == 0 {
+            let page = self.buckets[&bid].inline_page.as_ref().unwrap();
+            Ok(branch_pgid(page, r.index))
         } else {
-            let page = if self.buckets[&bid].header.root == 0 {
-                self.buckets[&bid].inline_page.clone().unwrap()
-            } else {
-                self.read_page(r.pgid)?
-            };
-            Ok(branch_pgid(&page, r.index))
+            self.with_page(r.pgid, |page| branch_pgid(page, r.index))
         }
     }
 
     pub fn cursor_first(&mut self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<Kv> {
+        if !self.cursor_first_move(bid, stack)? {
+            return Ok((None, None, 0));
+        }
+        self.key_value(bid, stack)
+    }
+
+    pub fn cursor_first_move(&self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<bool> {
         self.check_open()?;
         stack.clear();
         let root = self.buckets[&bid].header.root;
         match self.page_node(bid, root)? {
-            PageNode::Node(id) => stack.push(ElemRef {
-                node_id: Some(id),
-                pgid: root,
-                index: 0,
-            }),
-            PageNode::Bytes(_) => stack.push(ElemRef {
-                node_id: None,
-                pgid: root,
-                index: 0,
-            }),
-        }
-        self.go_to_first(bid, stack)?;
-        if let Some(last) = stack.last() {
-            if self.ref_count(bid, last)? == 0 {
-                return self.cursor_next(bid, stack);
+            PageNode::Node(id) => {
+                let count = self.buckets[&bid].nodes[&id].inodes.len();
+                stack.push(ElemRef::node(id, root, 0, count));
+            }
+            PageNode::Disk(pgid) => {
+                let count = self.with_page(pgid, |page| PageHeader::read(page).count as i32)?;
+                let mut er = ElemRef::disk(pgid, 0);
+                er.count = count;
+                stack.push(er);
+            }
+            PageNode::Inline => {
+                let count = self.buckets[&bid]
+                    .inline_page
+                    .as_ref()
+                    .map(|p| PageHeader::read(p).count as i32)
+                    .unwrap_or(0);
+                let mut er = ElemRef::disk(0, 0);
+                er.count = count;
+                stack.push(er);
             }
         }
-        self.key_value(bid, stack)
+        self.go_to_first(bid, stack)?;
+        if let Some(last) = stack.last_mut() {
+            let count = self.fill_ref_count(bid, last)?;
+            if count == 0 {
+                return self.cursor_next_move(bid, stack);
+            }
+        }
+        Ok(!stack.is_empty())
     }
 
     pub fn cursor_last(&mut self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<Kv> {
@@ -580,19 +735,28 @@ impl TxInner {
         match self.page_node(bid, root)? {
             PageNode::Node(id) => {
                 let count = self.buckets[&bid].nodes[&id].inodes.len();
-                stack.push(ElemRef {
-                    node_id: Some(id),
-                    pgid: root,
-                    index: count.saturating_sub(1),
-                });
+                stack.push(ElemRef::node(
+                    id,
+                    root,
+                    count.saturating_sub(1),
+                    count,
+                ));
             }
-            PageNode::Bytes(page) => {
-                let count = PageHeader::read(&page).count as usize;
-                stack.push(ElemRef {
-                    node_id: None,
-                    pgid: root,
-                    index: count.saturating_sub(1),
-                });
+            PageNode::Disk(pgid) => {
+                let count = self.with_page(pgid, |page| PageHeader::read(page).count as usize)?;
+                let mut er = ElemRef::disk(pgid, count.saturating_sub(1));
+                er.count = count as i32;
+                stack.push(er);
+            }
+            PageNode::Inline => {
+                let count = self.buckets[&bid]
+                    .inline_page
+                    .as_ref()
+                    .map(|p| PageHeader::read(p).count as usize)
+                    .unwrap_or(0);
+                let mut er = ElemRef::disk(0, count.saturating_sub(1));
+                er.count = count as i32;
+                stack.push(er);
             }
         }
         self.go_to_last(bid, stack)?;
@@ -620,19 +784,28 @@ impl TxInner {
             match self.page_node(bid, pgid)? {
                 PageNode::Node(id) => {
                     let count = self.buckets[&bid].nodes[&id].inodes.len();
-                    stack.push(ElemRef {
-                        node_id: Some(id),
+                    stack.push(ElemRef::node(
+                        id,
                         pgid,
-                        index: count.saturating_sub(1),
-                    });
+                        count.saturating_sub(1),
+                        count,
+                    ));
                 }
-                PageNode::Bytes(page) => {
-                    let count = PageHeader::read(&page).count as usize;
-                    stack.push(ElemRef {
-                        node_id: None,
-                        pgid,
-                        index: count.saturating_sub(1),
-                    });
+                PageNode::Disk(pgid) => {
+                    let count = self.with_page(pgid, |page| PageHeader::read(page).count as usize)?;
+                    let mut er = ElemRef::disk(pgid, count.saturating_sub(1));
+                    er.count = count as i32;
+                    stack.push(er);
+                }
+                PageNode::Inline => {
+                    let count = self.buckets[&bid]
+                        .inline_page
+                        .as_ref()
+                        .map(|p| PageHeader::read(p).count as usize)
+                        .unwrap_or(0);
+                    let mut er = ElemRef::disk(0, count.saturating_sub(1));
+                    er.count = count as i32;
+                    stack.push(er);
                 }
             }
         }
@@ -640,27 +813,42 @@ impl TxInner {
     }
 
     pub fn cursor_next(&mut self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<Kv> {
+        if !self.cursor_next_move(bid, stack)? {
+            return Ok((None, None, 0));
+        }
+        self.key_value(bid, stack)
+    }
+
+    pub fn cursor_next_move(&self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<bool> {
         loop {
             let mut i = stack.len() as isize - 1;
             while i >= 0 {
                 let idx = i as usize;
-                let count = self.ref_count(bid, &stack[idx])?;
+                let count = self.fill_ref_count(bid, &mut stack[idx])?;
                 if stack[idx].index + 1 < count {
                     stack[idx].index += 1;
+                    // Stayed on the same page — no need to descend again.
+                    if idx == stack.len() - 1 {
+                        return Ok(true);
+                    }
                     break;
                 }
                 i -= 1;
             }
             if i == -1 {
-                return Ok((None, None, 0));
+                stack.clear();
+                return Ok(false);
             }
             stack.truncate(i as usize + 1);
             self.go_to_first(bid, stack)?;
-            let last = stack.last().cloned().unwrap();
-            if self.ref_count(bid, &last)? == 0 {
+            let count = {
+                let last = stack.last_mut().unwrap();
+                self.fill_ref_count(bid, last)?
+            };
+            if count == 0 {
                 continue;
             }
-            return self.key_value(bid, stack);
+            return Ok(true);
         }
     }
 
@@ -882,18 +1070,28 @@ impl TxInner {
                     }
                 }
             }
-            PageNode::Bytes(page) => {
-                let hdr = PageHeader::read(&page);
-                if hdr.id > 1 {
-                    out.push((hdr.id, hdr.overflow));
+            PageNode::Disk(pgid) => {
+                let (id, overflow, is_branch, children) = self.with_page(pgid, |page| {
+                    let hdr = PageHeader::read(page);
+                    let children = if hdr.is_branch() {
+                        (0..hdr.count as usize)
+                            .map(|i| branch_pgid(page, i))
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    (hdr.id, hdr.overflow, hdr.is_branch(), children)
+                })?;
+                if id > 1 {
+                    out.push((id, overflow));
                 }
-                if hdr.is_branch() {
-                    for i in 0..hdr.count as usize {
-                        let child = branch_pgid(&page, i);
-                        self.collect_pages(bid, child, out)?;
+                if is_branch {
+                    for c in children {
+                        self.collect_pages(bid, c, out)?;
                     }
                 }
             }
+            PageNode::Inline => {}
         }
         Ok(())
     }
@@ -909,28 +1107,51 @@ impl TxInner {
         if value.len() > MAX_VALUE_SIZE {
             return Err(Error::ValueTooLarge);
         }
-        let new_key = key.to_vec();
         let mut stack = Vec::new();
-        let (k, _, flags) = self.cursor_seek(bid, &mut stack, &new_key)?;
-        if k.as_deref() == Some(new_key.as_slice()) && flags & BUCKET_LEAF_FLAG != 0 {
+        let (k, _, flags) = self.cursor_seek(bid, &mut stack, key)?;
+        if k.as_deref() == Some(key) && flags & BUCKET_LEAF_FLAG != 0 {
             return Err(Error::IncompatibleValue);
         }
         let nid = self.cursor_node(bid, &mut stack)?;
-        self.node_put(bid, nid, &new_key, &new_key, value, 0, 0);
+        self.node_put(bid, nid, key, key, value, 0, 0);
         Ok(())
     }
 
     pub fn get(&mut self, bid: BucketId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_open()?;
         let mut stack = Vec::new();
-        let (k, v, flags) = self.cursor_seek(bid, &mut stack, key)?;
-        if flags & BUCKET_LEAF_FLAG != 0 {
+        let root = self.buckets[&bid].header.root;
+        self.search(bid, &mut stack, key, root)?;
+        let Some(r) = stack.last() else {
+            return Ok(None);
+        };
+        let count = self.ref_count(bid, r)?;
+        if count == 0 || r.index >= count {
             return Ok(None);
         }
-        if k.as_deref() != Some(key) {
-            return Ok(None);
+        if let Some(id) = r.node_id {
+            let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
+            if inode.flags & BUCKET_LEAF_FLAG != 0 || inode.key.as_slice() != key {
+                return Ok(None);
+            }
+            return Ok(Some(inode.value.clone()));
         }
-        Ok(v)
+        if self.buckets[&bid].header.root == 0 {
+            let page = self.buckets[&bid].inline_page.as_ref().unwrap();
+            let (flags, k, v) = leaf_at(page, r.index);
+            if flags & BUCKET_LEAF_FLAG != 0 || k != key {
+                return Ok(None);
+            }
+            return Ok(Some(v.to_vec()));
+        }
+        self.with_page(r.pgid, |page| {
+            let (flags, k, v) = leaf_at(page, r.index);
+            if flags & BUCKET_LEAF_FLAG != 0 || k != key {
+                None
+            } else {
+                Some(v.to_vec())
+            }
+        })
     }
 
     pub fn delete(&mut self, bid: BucketId, key: &[u8]) -> Result<()> {
@@ -980,6 +1201,8 @@ impl TxInner {
         let (id, buf) = self
             .db
             .allocate(self.meta.txid, count, &mut self.meta.pgid)?;
+        // Writers may have grown the mapping; keep this tx's pin current.
+        let _ = self.refresh_mmap_pin();
         self.dirty.insert(id, buf);
         Ok(id)
     }
@@ -1022,32 +1245,32 @@ impl TxInner {
         index
     }
 
-    fn split_two(
-        &mut self,
-        bid: BucketId,
-        nid: NodeId,
-        page_size: usize,
-    ) -> (NodeId, Option<NodeId>) {
-        let (too_small, fill) = {
-            let b = &self.buckets[&bid];
-            let n = &b.nodes[&nid];
-            let small = n.inodes.len() <= MIN_KEYS_PER_PAGE * 2
-                || inodes_size(n.is_leaf, &n.inodes) < page_size;
-            (small, b.fill_percent)
-        };
-        if too_small {
-            return (nid, None);
-        }
-        let fill = fill.clamp(MIN_FILL_PERCENT, MAX_FILL_PERCENT);
-        let threshold = (page_size as f64 * fill) as usize;
-        let split_index = {
+    /// Split `nid` into page-sized sibling nodes. O(n) in inode count.
+    ///
+    /// Unlike Go's reslice-based peel loop, Rust `Vec::split_off` from the front is
+    /// O(n) per peel and became O(n²) for a huge dirty leaf. We take the inode list
+    /// once and consume prefixes instead.
+    fn split_node(&mut self, bid: BucketId, nid: NodeId, page_size: usize) -> Vec<NodeId> {
+        let (is_leaf, fill, needs_parent, inode_len) = {
             let n = &self.buckets[&bid].nodes[&nid];
-            Self::split_index(n.is_leaf, &n.inodes, threshold)
+            (
+                n.is_leaf,
+                self.buckets[&bid].fill_percent,
+                n.parent.is_none(),
+                n.inodes.len(),
+            )
         };
-        if split_index == 0 || split_index >= self.buckets[&bid].nodes[&nid].inodes.len() {
-            return (nid, None);
+        if inode_len <= MIN_KEYS_PER_PAGE * 2 {
+            return vec![nid];
         }
-        if self.buckets[&bid].nodes[&nid].parent.is_none() {
+        {
+            let n = &self.buckets[&bid].nodes[&nid];
+            if inodes_size_less_than(n.is_leaf, &n.inodes, page_size) {
+                return vec![nid];
+            }
+        }
+
+        if needs_parent {
             let pid = self.buckets.get_mut(&bid).unwrap().alloc_node();
             self.buckets.get_mut(&bid).unwrap().nodes.insert(
                 pid,
@@ -1072,51 +1295,85 @@ impl TxInner {
                 .parent = Some(pid);
         }
         let parent_id = self.buckets[&bid].nodes[&nid].parent.unwrap();
-        let next_id = self.buckets.get_mut(&bid).unwrap().alloc_node();
-        let is_leaf = self.buckets[&bid].nodes[&nid].is_leaf;
-        let rest = self
-            .buckets
-            .get_mut(&bid)
-            .unwrap()
-            .nodes
-            .get_mut(&nid)
-            .unwrap()
-            .inodes
-            .split_off(split_index);
-        self.buckets.get_mut(&bid).unwrap().nodes.insert(
-            next_id,
-            Node {
-                is_leaf,
-                unbalanced: false,
-                spilled: false,
-                key: Vec::new(),
-                pgid: 0,
-                overflow: 0,
-                parent: Some(parent_id),
-                children: Vec::new(),
-                inodes: rest,
-            },
-        );
-        self.buckets
-            .get_mut(&bid)
-            .unwrap()
-            .nodes
-            .get_mut(&parent_id)
-            .unwrap()
-            .children
-            .push(next_id);
-        (nid, Some(next_id))
-    }
+        let fill = fill.clamp(MIN_FILL_PERCENT, MAX_FILL_PERCENT);
+        let threshold = (page_size as f64 * fill) as usize;
 
-    fn split_node(&mut self, bid: BucketId, nid: NodeId, page_size: usize) -> Vec<NodeId> {
-        let mut nodes = Vec::new();
-        let mut cur = nid;
-        loop {
-            let (a, b) = self.split_two(bid, cur, page_size);
-            nodes.push(a);
-            match b {
-                Some(next) => cur = next,
-                None => break,
+        let all = std::mem::take(
+            &mut self
+                .buckets
+                .get_mut(&bid)
+                .unwrap()
+                .nodes
+                .get_mut(&nid)
+                .unwrap()
+                .inodes,
+        );
+
+        // Cut points into `all` (exclusive ends).
+        let mut cuts = Vec::with_capacity(all.len() / MIN_KEYS_PER_PAGE + 2);
+        cuts.push(0usize);
+        let mut start = 0usize;
+        while start < all.len() {
+            let slice = &all[start..];
+            if slice.len() <= MIN_KEYS_PER_PAGE * 2
+                || inodes_size_less_than(is_leaf, slice, page_size)
+            {
+                cuts.push(all.len());
+                break;
+            }
+            let local = Self::split_index(is_leaf, slice, threshold);
+            if local == 0 || local >= slice.len() {
+                cuts.push(all.len());
+                break;
+            }
+            let next = start + local;
+            if next <= start || next >= all.len() {
+                cuts.push(all.len());
+                break;
+            }
+            cuts.push(next);
+            start = next;
+        }
+
+        let mut nodes = Vec::with_capacity(cuts.len().saturating_sub(1));
+        let mut iter = all.into_iter();
+        for (i, w) in cuts.windows(2).enumerate() {
+            let len = w[1] - w[0];
+            let chunk: Vec<Inode> = iter.by_ref().take(len).collect();
+            if i == 0 {
+                self.buckets
+                    .get_mut(&bid)
+                    .unwrap()
+                    .nodes
+                    .get_mut(&nid)
+                    .unwrap()
+                    .inodes = chunk;
+                nodes.push(nid);
+            } else {
+                let id = self.buckets.get_mut(&bid).unwrap().alloc_node();
+                self.buckets.get_mut(&bid).unwrap().nodes.insert(
+                    id,
+                    Node {
+                        is_leaf,
+                        unbalanced: false,
+                        spilled: false,
+                        key: Vec::new(),
+                        pgid: 0,
+                        overflow: 0,
+                        parent: Some(parent_id),
+                        children: Vec::new(),
+                        inodes: chunk,
+                    },
+                );
+                self.buckets
+                    .get_mut(&bid)
+                    .unwrap()
+                    .nodes
+                    .get_mut(&parent_id)
+                    .unwrap()
+                    .children
+                    .push(id);
+                nodes.push(id);
             }
         }
         nodes
@@ -1156,9 +1413,16 @@ impl TxInner {
         let parts = self.split_node(bid, nid, page_size);
         for pid in parts {
             self.free_node_page(bid, pid);
-            let (is_leaf, inodes, parent, old_key) = {
+            let (is_leaf, parent, old_key, first_key, inodes) = {
                 let n = &self.buckets[&bid].nodes[&pid];
-                (n.is_leaf, n.inodes.clone(), n.parent, n.key.clone())
+                let first_key = n.inodes.first().map(|i| i.key.clone()).unwrap_or_default();
+                (
+                    n.is_leaf,
+                    n.parent,
+                    n.key.clone(),
+                    first_key,
+                    n.inodes.clone(), // page-sized after split (~tens of keys), not the full pre-split node
+                )
             };
             let size = inodes_size(is_leaf, &inodes);
             let npages = size.div_ceil(page_size).max(1);
@@ -1167,7 +1431,6 @@ impl TxInner {
                 let page = self.dirty.get_mut(&pgid).unwrap();
                 write_inodes(page, is_leaf, &inodes);
             }
-            let first_key = inodes.first().map(|i| i.key.clone()).unwrap_or_default();
             {
                 let n = self
                     .buckets
@@ -1670,6 +1933,56 @@ impl TxInner {
         );
         Ok(())
     }
+}
+
+/// Binary-search a branch page; sets stack index; returns child pgid.
+fn search_page_index(stack: &mut [ElemRef], page: &[u8], key: &[u8]) -> Pgid {
+    let hdr = PageHeader::read(page);
+    let count = hdr.count as usize;
+    let mut exact = false;
+    let mut lo = 0;
+    let mut hi = count;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let (_, k) = branch_at(page, mid);
+        match k.cmp(key) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                exact = true;
+                lo = mid;
+                break;
+            }
+        }
+    }
+    let mut index = lo;
+    if !exact && index > 0 {
+        index -= 1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    if index >= count {
+        index = count - 1;
+    }
+    stack.last_mut().unwrap().index = index;
+    branch_pgid(page, index)
+}
+
+fn nsearch_page(stack: &mut [ElemRef], page: &[u8], key: &[u8]) {
+    let count = PageHeader::read(page).count as usize;
+    let mut lo = 0;
+    let mut hi = count;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let (_, k, _) = leaf_at(page, mid);
+        if k < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    stack.last_mut().unwrap().index = lo;
 }
 
 impl Drop for TxInner {

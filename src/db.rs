@@ -54,7 +54,8 @@ impl FlagLock {
 }
 
 pub struct MmapSlot {
-    pub mmap: Option<Mmap>,
+    /// Shared so open transactions can pin a stable mapping while writers remap.
+    pub mmap: Option<Arc<Mmap>>,
     pub datasz: usize,
 }
 
@@ -93,10 +94,18 @@ impl DbInner {
         Error::io(&self.path, e)
     }
 
-    pub fn read_page(&self, pgid: Pgid) -> Result<Vec<u8>> {
+    /// Clone the current mmap pin (cheap). Transactions keep this for zero-copy reads.
+    pub fn pin_mmap(&self) -> Result<Arc<Mmap>> {
         let slot = self.mmap.read();
-        let mmap = slot.mmap.as_ref().ok_or(Error::InvalidMapping)?;
-        let start = pgid as usize * self.page_size;
+        slot.mmap
+            .as_ref()
+            .cloned()
+            .ok_or(Error::InvalidMapping)
+    }
+
+    /// Byte range for `pgid` within a pinned mmap (including overflow pages).
+    pub fn page_bytes<'a>(mmap: &'a Mmap, page_size: usize, pgid: Pgid) -> Result<&'a [u8]> {
+        let start = pgid as usize * page_size;
         if start + PAGE_HEADER_SIZE > mmap.len() {
             return Err(Error::Corrupt(format!(
                 "page {pgid} starts past mmap ({} bytes)",
@@ -104,13 +113,19 @@ impl DbInner {
             )));
         }
         let hdr = PageHeader::read(&mmap[start..]);
-        let n = (hdr.overflow as usize + 1) * self.page_size;
+        let n = (hdr.overflow as usize + 1) * page_size;
         if start + n > mmap.len() {
             return Err(Error::Corrupt(format!(
                 "page {pgid} overflow extends past mmap"
             )));
         }
-        Ok(mmap[start..start + n].to_vec())
+        Ok(&mmap[start..start + n])
+    }
+
+    pub fn read_page(&self, pgid: Pgid) -> Result<Vec<u8>> {
+        let slot = self.mmap.read();
+        let mmap = slot.mmap.as_ref().ok_or(Error::InvalidMapping)?;
+        Ok(Self::page_bytes(mmap, self.page_size, pgid)?.to_vec())
     }
 
     pub fn write_at(&self, buf: &[u8], off: u64) -> Result<()> {
@@ -174,7 +189,7 @@ impl DbInner {
         slot.mmap = None;
         let mmap = platform::map_file(&self.file, &self.path, map_len, self.mmap_flags)?;
         slot.datasz = mmap.len();
-        slot.mmap = Some(mmap);
+        slot.mmap = Some(Arc::new(mmap));
         Ok(())
     }
 
@@ -468,7 +483,7 @@ impl Db {
             let mmap = platform::map_file(&file, path, map_len, opts.mmap_flags)?;
             MmapSlot {
                 datasz: mmap.len(),
-                mmap: Some(mmap),
+                mmap: Some(Arc::new(mmap)),
             }
         };
 

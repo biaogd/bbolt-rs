@@ -281,6 +281,7 @@ pub fn set_page_overflow(buf: &mut [u8], overflow: u32) {
 }
 
 /// Leaf element at `index`, returning (flags, key, value).
+#[inline(always)]
 pub fn leaf_at(page: &[u8], index: usize) -> (u32, &[u8], &[u8]) {
     let off = PAGE_HEADER_SIZE + index * LEAF_PAGE_ELEMENT_SIZE;
     let flags = read_u32(page, off);
@@ -421,6 +422,24 @@ pub fn inodes_size(is_leaf: bool, inodes: &[Inode]) -> usize {
         sz += elsz + inode.key.len() + inode.value.len();
     }
     sz
+}
+
+/// Upstream `node.sizeLessThan`: true iff serialized size is strictly below `limit`.
+/// Short-circuits as soon as the running size reaches `limit` (critical for spill of huge nodes).
+pub fn inodes_size_less_than(is_leaf: bool, inodes: &[Inode], limit: usize) -> bool {
+    let elsz = if is_leaf {
+        LEAF_PAGE_ELEMENT_SIZE
+    } else {
+        BRANCH_PAGE_ELEMENT_SIZE
+    };
+    let mut sz = PAGE_HEADER_SIZE;
+    for inode in inodes {
+        sz += elsz + inode.key.len() + inode.value.len();
+        if sz >= limit {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Clone, Debug, Default)]

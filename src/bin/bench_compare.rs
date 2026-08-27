@@ -221,10 +221,12 @@ fn timed_cursor_scan(path: &Path, opts: &Options) -> Result<(usize, u128), Strin
     db.view(|tx| {
         let b = tx.bucket(b"bench").ok_or(bbolt::Error::BucketNotFound)?;
         let mut c = b.cursor();
-        let mut kv = c.first()?;
-        while kv.0.is_some() {
+        // Match Go harness: `for k, _ := c.First(); k != nil; k, _ = c.Next()`
+        let mut ok = c.first_view()?;
+        while ok {
             count += 1;
-            kv = c.next()?;
+            let _ = c.key();
+            ok = c.next_view()?;
         }
         Ok(())
     })
