@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.db
+!tests/fixtures/*.db

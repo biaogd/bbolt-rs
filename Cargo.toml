@@ -1,0 +1,23 @@
+[package]
+name = "bbolt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "A Rust port of etcd-io/bbolt: mmap-backed B+tree embedded key/value store"
+readme = "README.md"
+keywords = ["database", "embedded", "bbolt", "bolt", "key-value"]
+categories = ["database-implementations"]
+
+[dependencies]
+libc = "0.2"
+memmap2 = "0.9"
+parking_lot = "0.12"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "=3.14.0"
+
+[lib]
+name = "bbolt"
+path = "src/lib.rs"
