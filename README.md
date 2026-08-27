@@ -35,7 +35,7 @@ Core operations and most of the public Go surface are implemented with on-disk f
 
 ## Upstream test suite coverage
 
-Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate maps **150+** of those names via `// Go: TestX` comments (grep `Go:`). `cargo test` runs ~200 library/CLI tests (a few large simulations are `#[ignore]`).
+Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate maps **~186** of those names via `// Go: TestX` comments (grep `Go:`), including **173/223** tests from the priority library files. `cargo test` runs **208** tests by default (**12** large simulations are `#[ignore]`).
 
 | Upstream file | Status |
 | --- | --- |
