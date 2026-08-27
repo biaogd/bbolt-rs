@@ -77,7 +77,7 @@ impl Bucket {
     /// (no heap allocation of the value bytes).
     pub fn has_value(&self, key: &[u8]) -> bool {
         self.tx
-            .borrow_mut()
+            .borrow()
             .has_value(self.id, key)
             .unwrap_or(false)
     }

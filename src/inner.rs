@@ -35,7 +35,7 @@ pub struct Node {
 
 pub struct BucketInner {
     pub header: InBucket,
-    pub nodes: HashMap<NodeId, Node>,
+    pub nodes: NodeMap,
     pub nodes_by_pgid: HashMap<Pgid, NodeId>,
     pub root_node: Option<NodeId>,
     pub inline_page: Option<Vec<u8>>,
@@ -44,11 +44,74 @@ pub struct BucketInner {
     pub next_node_id: NodeId,
 }
 
+/// Dense `NodeId` → `Node` store (IDs are allocated monotonically from 1).
+#[derive(Default)]
+pub struct NodeMap {
+    slots: Vec<Option<Node>>,
+}
+
+impl NodeMap {
+    fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    #[inline]
+    fn get(&self, id: &NodeId) -> Option<&Node> {
+        self.slots.get(*id as usize).and_then(|s| s.as_ref())
+    }
+
+    #[inline]
+    fn get_mut(&mut self, id: &NodeId) -> Option<&mut Node> {
+        self.slots.get_mut(*id as usize).and_then(|s| s.as_mut())
+    }
+
+    #[inline]
+    fn insert(&mut self, id: NodeId, node: Node) {
+        let i = id as usize;
+        if self.slots.len() <= i {
+            self.slots.resize_with(i + 1, || None);
+        }
+        self.slots[i] = Some(node);
+    }
+
+    #[inline]
+    fn remove(&mut self, id: &NodeId) -> Option<Node> {
+        self.slots.get_mut(*id as usize).and_then(|s| s.take())
+    }
+
+    fn iter_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| n.as_ref().map(|_| i as NodeId))
+    }
+
+    #[allow(dead_code)]
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.slots.iter_mut().filter_map(|s| s.as_mut())
+    }
+}
+
+impl std::ops::Index<&NodeId> for NodeMap {
+    type Output = Node;
+    #[inline]
+    fn index(&self, id: &NodeId) -> &Node {
+        self.slots[*id as usize].as_ref().unwrap()
+    }
+}
+
+impl std::ops::IndexMut<&NodeId> for NodeMap {
+    #[inline]
+    fn index_mut(&mut self, id: &NodeId) -> &mut Node {
+        self.slots[*id as usize].as_mut().unwrap()
+    }
+}
+
 impl BucketInner {
     fn new(header: InBucket) -> Self {
         Self {
             header,
-            nodes: HashMap::new(),
+            nodes: NodeMap::new(),
             nodes_by_pgid: HashMap::new(),
             root_node: None,
             inline_page: None,
@@ -65,7 +128,7 @@ impl BucketInner {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ElemRef {
     pub node_id: Option<NodeId>,
     pub pgid: Pgid,
@@ -113,6 +176,8 @@ pub struct TxInner {
     get_stack: Vec<ElemRef>,
     /// Hint for sequential deletes: last leaf node we deleted from.
     delete_hint: Option<(BucketId, NodeId)>,
+    /// Hint for sequential puts: last leaf node we appended to.
+    put_hint: Option<(BucketId, NodeId)>,
 }
 
 enum PageNode {
@@ -146,6 +211,7 @@ impl TxInner {
             mmap_pin,
             get_stack: Vec::with_capacity(16),
             delete_hint: None,
+            put_hint: None,
         }
     }
 
@@ -636,53 +702,6 @@ impl TxInner {
         })
     }
 
-    /// Zero-copy key/value pointers for the current stack position (Go Cursor semantics).
-    /// Pointers remain valid until the next structural mutation or transaction close.
-    pub fn cursor_kv_ptrs(
-        &self,
-        bid: BucketId,
-        stack: &[ElemRef],
-    ) -> Result<Option<(*const u8, usize, *const u8, usize, u32)>> {
-        let Some(r) = stack.last() else {
-            return Ok(None);
-        };
-        let count = self.ref_count(bid, r)?;
-        if count == 0 || r.index >= count {
-            return Ok(None);
-        }
-        if let Some(id) = r.node_id {
-            let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
-            return Ok(Some((
-                inode.key.as_ptr(),
-                inode.key.len(),
-                inode.value.as_ptr(),
-                inode.value.len(),
-                inode.flags,
-            )));
-        }
-        if self.buckets[&bid].header.root == 0 {
-            let page_ref = self.buckets[&bid].inline_page.as_ref().unwrap();
-            let (flags, key, val) = leaf_at(page_ref, r.index);
-            return Ok(Some((
-                key.as_ptr(),
-                key.len(),
-                val.as_ptr(),
-                val.len(),
-                flags,
-            )));
-        }
-        self.with_page(r.pgid, |page_ref| {
-            let (flags, key, val) = leaf_at(page_ref, r.index);
-            Some((
-                key.as_ptr(),
-                key.len(),
-                val.as_ptr(),
-                val.len(),
-                flags,
-            ))
-        })
-    }
-
     fn go_to_first(&self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<()> {
         loop {
             let last = stack.last().cloned().unwrap();
@@ -1087,7 +1106,7 @@ impl TxInner {
                 }
             }
         }
-        for nid in self.buckets[&bid].nodes.keys().copied().collect::<Vec<_>>() {
+        for nid in self.buckets[&bid].nodes.iter_ids().collect::<Vec<_>>() {
             let n = self
                 .buckets
                 .get_mut(&bid)
@@ -1152,14 +1171,39 @@ impl TxInner {
         if value.len() > MAX_VALUE_SIZE {
             return Err(Error::ValueTooLarge);
         }
-        let mut stack = Vec::new();
-        let (k, _, flags) = self.cursor_seek(bid, &mut stack, key)?;
-        if k.as_deref() == Some(key) && flags & BUCKET_LEAF_FLAG != 0 {
-            return Err(Error::IncompatibleValue);
+        // Fast path: sequential appends stay on the same leaf (bulk loads).
+        if let Some((hbid, nid)) = self.put_hint {
+            if hbid == bid {
+                let can_append = self.buckets.get(&bid).and_then(|b| b.nodes.get(&nid)).is_some_and(
+                    |n| {
+                        n.is_leaf
+                            && n.inodes
+                                .back()
+                                .is_none_or(|last| last.key.as_slice() < key)
+                    },
+                );
+                if can_append {
+                    // Ensure we are not colliding with a nested bucket at `key`
+                    // (impossible on a pure append past last key, but keep the check cheap).
+                    self.node_put(bid, nid, key, key, value, 0, 0);
+                    return Ok(());
+                }
+            }
         }
-        let nid = self.cursor_node(bid, &mut stack)?;
-        self.node_put(bid, nid, key, key, value, 0, 0);
-        Ok(())
+        let mut stack = std::mem::take(&mut self.get_stack);
+        stack.clear();
+        let result = (|| {
+            let (k, _, flags) = self.cursor_seek(bid, &mut stack, key)?;
+            if k.as_deref() == Some(key) && flags & BUCKET_LEAF_FLAG != 0 {
+                return Err(Error::IncompatibleValue);
+            }
+            let nid = self.cursor_node(bid, &mut stack)?;
+            self.node_put(bid, nid, key, key, value, 0, 0);
+            self.put_hint = Some((bid, nid));
+            Ok(())
+        })();
+        self.get_stack = stack;
+        result
     }
 
     pub fn get(&mut self, bid: BucketId, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1205,47 +1249,53 @@ impl TxInner {
     }
 
     /// Like Go `Bucket.Get(key) != nil` without allocating value bytes.
-    pub fn has_value(&mut self, bid: BucketId, key: &[u8]) -> Result<bool> {
-        self.check_open()?;
-        let mut pgid = self.buckets[&bid].header.root;
+    pub fn has_value(&self, bid: BucketId, key: &[u8]) -> Result<bool> {
+        if self.closed {
+            return Err(Error::TxClosed);
+        }
+        let b = self.buckets.get(&bid).ok_or(Error::TxClosed)?;
+        let mut pgid = b.header.root;
         if pgid == 0 {
-            let page = self.buckets[&bid]
+            let page = b
                 .inline_page
                 .as_ref()
                 .ok_or_else(|| Error::Corrupt("inline missing".into()))?;
             return Ok(leaf_has_value(page, key));
         }
         loop {
-            // Prefer in-memory nodes when present (writable txs).
-            if let Some(id) = self.buckets[&bid].nodes_by_pgid.get(&pgid).copied() {
-                let n = &self.buckets[&bid].nodes[&id];
-                if n.is_leaf {
-                    let index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
-                    return Ok(index < n.inodes.len()
-                        && n.inodes[index].key.as_slice() == key
-                        && n.inodes[index].flags & BUCKET_LEAF_FLAG == 0);
+            if !b.nodes_by_pgid.is_empty() {
+                if let Some(id) = b.nodes_by_pgid.get(&pgid).copied() {
+                    let n = &b.nodes[&id];
+                    if n.is_leaf {
+                        let index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
+                        return Ok(index < n.inodes.len()
+                            && n.inodes[index].key.as_slice() == key
+                            && n.inodes[index].flags & BUCKET_LEAF_FLAG == 0);
+                    }
+                    let mut exact = false;
+                    let mut index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
+                    if index < n.inodes.len() && n.inodes[index].key == key {
+                        exact = true;
+                    }
+                    if !exact && index > 0 {
+                        index -= 1;
+                    }
+                    if index >= n.inodes.len() {
+                        index = n.inodes.len().saturating_sub(1);
+                    }
+                    pgid = n.inodes[index].pgid;
+                    continue;
                 }
-                let mut exact = false;
-                let mut index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
-                if index < n.inodes.len() && n.inodes[index].key == key {
-                    exact = true;
-                }
-                if !exact && index > 0 {
-                    index -= 1;
-                }
-                if index >= n.inodes.len() {
-                    index = n.inodes.len().saturating_sub(1);
-                }
-                pgid = n.inodes[index].pgid;
-                continue;
             }
-            if let Some(p) = self.dirty.get(&pgid) {
-                let hdr = PageHeader::read(p);
-                if hdr.is_leaf() {
-                    return Ok(leaf_has_value(p, key));
+            if !self.dirty.is_empty() {
+                if let Some(p) = self.dirty.get(&pgid) {
+                    let hdr = PageHeader::read(p);
+                    if hdr.is_leaf() {
+                        return Ok(leaf_has_value(p, key));
+                    }
+                    pgid = search_page_index_pgid(p, key);
+                    continue;
                 }
-                pgid = search_page_index_pgid(p, key);
-                continue;
             }
             let page = DbInner::page_bytes(&self.mmap_pin, self.db.page_size, pgid)?;
             let hdr = PageHeader::read(page);
@@ -1258,6 +1308,7 @@ impl TxInner {
 
     pub fn delete(&mut self, bid: BucketId, key: &[u8]) -> Result<()> {
         self.check_writable()?;
+        self.put_hint = None;
         // Fast path: sequential deletes often stay on the same leaf.
         if let Some((hbid, nid)) = self.delete_hint {
             if hbid == bid {
@@ -1935,9 +1986,9 @@ impl TxInner {
     }
 
     fn rebalance_bucket(&mut self, bid: BucketId) -> Result<()> {
-        let ids: Vec<NodeId> = self.buckets[&bid].nodes.keys().copied().collect();
+        let ids: Vec<NodeId> = self.buckets[&bid].nodes.iter_ids().collect();
         for id in ids {
-            if self.buckets[&bid].nodes.contains_key(&id) {
+            if self.buckets[&bid].nodes.get(&id).is_some() {
                 self.rebalance_node(bid, id)?;
             }
         }

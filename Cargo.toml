@@ -16,6 +16,9 @@ parking_lot = "0.12"
 thiserror = "2"
 clap = { version = "=4.5.23", features = ["derive"] }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
