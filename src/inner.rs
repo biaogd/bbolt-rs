@@ -1,6 +1,6 @@
 //! In-memory transaction state: nodes, buckets, cursors, commit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -30,7 +30,7 @@ pub struct Node {
     pub overflow: u32,
     pub parent: Option<NodeId>,
     pub children: Vec<NodeId>,
-    pub inodes: Vec<Inode>,
+    pub inodes: VecDeque<Inode>,
 }
 
 pub struct BucketInner {
@@ -111,6 +111,8 @@ pub struct TxInner {
     pub(crate) mmap_pin: Arc<Mmap>,
     /// Reused search stack for Get/has_value (avoids per-op Vec alloc).
     get_stack: Vec<ElemRef>,
+    /// Hint for sequential deletes: last leaf node we deleted from.
+    delete_hint: Option<(BucketId, NodeId)>,
 }
 
 enum PageNode {
@@ -143,6 +145,7 @@ impl TxInner {
             stats: TxStats::default(),
             mmap_pin,
             get_stack: Vec::with_capacity(16),
+            delete_hint: None,
         }
     }
 
@@ -234,10 +237,10 @@ impl TxInner {
             self.read_page(pgid)?
         };
         let hdr = PageHeader::read(&page);
-        let inodes = read_inodes(&page);
+        let inodes: VecDeque<Inode> = read_inodes(&page).into();
         let b = self.buckets.get_mut(&bid).unwrap();
         let id = b.alloc_node();
-        let key = inodes.first().map(|i| i.key.clone()).unwrap_or_default();
+        let key = inodes.front().map(|i| i.key.clone()).unwrap_or_default();
         b.nodes.insert(
             id,
             Node {
@@ -292,13 +295,13 @@ impl TxInner {
             .get_mut(&nid)
             .unwrap();
         // Fast path: sequential append (common for bulk loads).
-        if let Some(last) = n.inodes.last() {
+        if let Some(last) = n.inodes.back() {
             if last.key.as_slice() < old_key {
                 if n.inodes.len() == n.inodes.capacity() {
                     // Grow in page-sized chunks to cut realloc traffic on bulk loads.
                     n.inodes.reserve((self.db.page_size / 32).max(64));
                 }
-                n.inodes.push(Inode {
+                n.inodes.push_back(Inode {
                     flags,
                     pgid,
                     key: new_key.to_vec(),
@@ -307,7 +310,7 @@ impl TxInner {
                 return;
             }
             if last.key.as_slice() == old_key {
-                let inode = n.inodes.last_mut().unwrap();
+                let inode = n.inodes.back_mut().unwrap();
                 inode.flags = flags;
                 inode.key = new_key.to_vec();
                 inode.value = value.to_vec();
@@ -315,7 +318,7 @@ impl TxInner {
                 return;
             }
         } else {
-            n.inodes.push(Inode {
+            n.inodes.push_back(Inode {
                 flags,
                 pgid,
                 key: new_key.to_vec(),
@@ -347,8 +350,34 @@ impl TxInner {
         if index >= n.inodes.len() || n.inodes[index].key != key {
             return;
         }
-        n.inodes.remove(index);
+        Self::inode_remove(&mut n.inodes, index);
         n.unbalanced = true;
+    }
+
+    pub(crate) fn node_del_at(&mut self, bid: BucketId, nid: NodeId, index: usize) {
+        let n = self
+            .buckets
+            .get_mut(&bid)
+            .unwrap()
+            .nodes
+            .get_mut(&nid)
+            .unwrap();
+        if index >= n.inodes.len() {
+            return;
+        }
+        Self::inode_remove(&mut n.inodes, index);
+        n.unbalanced = true;
+    }
+
+    #[inline]
+    fn inode_remove(inodes: &mut VecDeque<Inode>, index: usize) {
+        if index == 0 {
+            inodes.pop_front();
+        } else if index + 1 == inodes.len() {
+            inodes.pop_back();
+        } else {
+            inodes.remove(index);
+        }
     }
 
     pub fn cursor_seek(
@@ -481,12 +510,14 @@ impl TxInner {
     }
 
     pub(crate) fn ref_count(&self, bid: BucketId, r: &ElemRef) -> Result<usize> {
+        // Always re-read materialized nodes — inode count changes on put/delete.
+        if let Some(id) = r.node_id {
+            return Ok(self.buckets[&bid].nodes[&id].inodes.len());
+        }
         if r.count >= 0 {
             return Ok(r.count as usize);
         }
-        if let Some(id) = r.node_id {
-            Ok(self.buckets[&bid].nodes[&id].inodes.len())
-        } else if self.buckets[&bid].header.root == 0 {
+        if self.buckets[&bid].header.root == 0 {
             let page = self.buckets[&bid]
                 .inline_page
                 .as_ref()
@@ -899,11 +930,14 @@ impl TxInner {
         let mut n = if let Some(id) = stack[0].node_id {
             id
         } else {
-            self.materialize_node(bid, first_pgid, None)?
+            let id = self.materialize_node(bid, first_pgid, None)?;
+            stack[0].node_id = Some(id);
+            id
         };
-        let indices: Vec<usize> = stack[..stack.len() - 1].iter().map(|r| r.index).collect();
-        for idx in indices {
+        for i in 0..stack.len() - 1 {
+            let idx = stack[i].index;
             n = self.child_at(bid, n, idx)?;
+            stack[i + 1].node_id = Some(n);
         }
         Ok(n)
     }
@@ -1224,6 +1258,46 @@ impl TxInner {
 
     pub fn delete(&mut self, bid: BucketId, key: &[u8]) -> Result<()> {
         self.check_writable()?;
+        // Fast path: sequential deletes often stay on the same leaf.
+        if let Some((hbid, nid)) = self.delete_hint {
+            if hbid == bid {
+                let hit = self.buckets.get(&bid).and_then(|b| b.nodes.get(&nid)).and_then(|n| {
+                    if !n.is_leaf || n.inodes.is_empty() {
+                        return None;
+                    }
+                    if n.inodes.front().map(|i| i.key.as_slice()) == Some(key) {
+                        return Some((0usize, n.inodes[0].flags));
+                    }
+                    let first = n.inodes.front()?.key.as_slice();
+                    let last = n.inodes.back()?.key.as_slice();
+                    if key < first || key > last {
+                        return None;
+                    }
+                    let index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
+                    if index < n.inodes.len() && n.inodes[index].key.as_slice() == key {
+                        Some((index, n.inodes[index].flags))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((index, flags)) = hit {
+                    if flags & BUCKET_LEAF_FLAG != 0 {
+                        return Err(Error::IncompatibleValue);
+                    }
+                    self.node_del_at(bid, nid, index);
+                    if self.buckets[&bid]
+                        .nodes
+                        .get(&nid)
+                        .map(|n| n.inodes.is_empty())
+                        .unwrap_or(true)
+                    {
+                        self.delete_hint = None;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         let mut stack = std::mem::take(&mut self.get_stack);
         stack.clear();
         let result = (|| {
@@ -1236,17 +1310,20 @@ impl TxInner {
             if count == 0 || r.index >= count {
                 return Ok(());
             }
-            // Verify key + not a bucket without cloning.
+            let index = r.index;
             let (matches, is_bucket) = if let Some(id) = r.node_id {
-                let inode = &self.buckets[&bid].nodes[&id].inodes[r.index];
-                (inode.key.as_slice() == key, inode.flags & BUCKET_LEAF_FLAG != 0)
+                let inode = &self.buckets[&bid].nodes[&id].inodes[index];
+                (
+                    inode.key.as_slice() == key,
+                    inode.flags & BUCKET_LEAF_FLAG != 0,
+                )
             } else if self.buckets[&bid].header.root == 0 {
                 let page = self.buckets[&bid].inline_page.as_ref().unwrap();
-                let (flags, k, _) = leaf_at(page, r.index);
+                let (flags, k, _) = leaf_at(page, index);
                 (k == key, flags & BUCKET_LEAF_FLAG != 0)
             } else {
                 self.with_page(r.pgid, |page| {
-                    let (flags, k, _) = leaf_at(page, r.index);
+                    let (flags, k, _) = leaf_at(page, index);
                     (k == key, flags & BUCKET_LEAF_FLAG != 0)
                 })?
             };
@@ -1257,7 +1334,13 @@ impl TxInner {
                 return Err(Error::IncompatibleValue);
             }
             let nid = self.cursor_node(bid, &mut stack)?;
-            self.node_del(bid, nid, key);
+            let leaf_index = stack.last().map(|e| e.index).unwrap_or(index);
+            self.node_del_at(bid, nid, leaf_index);
+            self.delete_hint = if self.buckets[&bid].nodes[&nid].inodes.is_empty() {
+                None
+            } else {
+                Some((bid, nid))
+            };
             Ok(())
         })();
         self.get_stack = stack;
@@ -1378,7 +1461,7 @@ impl TxInner {
                     overflow: 0,
                     parent: None,
                     children: vec![nid],
-                    inodes: Vec::new(),
+                    inodes: VecDeque::new(),
                 },
             );
             self.buckets
@@ -1393,7 +1476,7 @@ impl TxInner {
         let fill = fill.clamp(MIN_FILL_PERCENT, MAX_FILL_PERCENT);
         let threshold = (page_size as f64 * fill) as usize;
 
-        let all = std::mem::take(
+        let all: Vec<Inode> = std::mem::take(
             &mut self
                 .buckets
                 .get_mut(&bid)
@@ -1402,7 +1485,8 @@ impl TxInner {
                 .get_mut(&nid)
                 .unwrap()
                 .inodes,
-        );
+        )
+        .into();
 
         // Cut points into `all` (exclusive ends).
         let mut cuts = Vec::with_capacity(all.len() / MIN_KEYS_PER_PAGE + 2);
@@ -1442,7 +1526,7 @@ impl TxInner {
                     .nodes
                     .get_mut(&nid)
                     .unwrap()
-                    .inodes = chunk;
+                    .inodes = VecDeque::from(chunk);
                 nodes.push(nid);
             } else {
                 let id = self.buckets.get_mut(&bid).unwrap().alloc_node();
@@ -1457,7 +1541,7 @@ impl TxInner {
                         overflow: 0,
                         parent: Some(parent_id),
                         children: Vec::new(),
-                        inodes: chunk,
+                        inodes: VecDeque::from(chunk),
                     },
                 );
                 self.buckets
@@ -1482,12 +1566,12 @@ impl TxInner {
         children.sort_by(|a, b| {
             let ka = self.buckets[&bid].nodes[a]
                 .inodes
-                .first()
+                .front()
                 .map(|i| i.key.as_slice())
                 .unwrap_or(b"");
             let kb = self.buckets[&bid].nodes[b]
                 .inodes
-                .first()
+                .front()
                 .map(|i| i.key.as_slice())
                 .unwrap_or(b"");
             ka.cmp(kb)
@@ -1510,13 +1594,14 @@ impl TxInner {
             self.free_node_page(bid, pid);
             let (is_leaf, parent, old_key, first_key, inodes) = {
                 let n = &self.buckets[&bid].nodes[&pid];
-                let first_key = n.inodes.first().map(|i| i.key.clone()).unwrap_or_default();
+                let first_key = n.inodes.front().map(|i| i.key.clone()).unwrap_or_default();
                 (
                     n.is_leaf,
                     n.parent,
                     n.key.clone(),
                     first_key,
-                    n.inodes.clone(), // page-sized after split (~tens of keys), not the full pre-split node
+                    // page-sized after split (~tens of keys), not the full pre-split node
+                    n.inodes.iter().cloned().collect::<Vec<_>>(),
                 )
             };
             let size = inodes_size(is_leaf, &inodes);
@@ -1603,7 +1688,8 @@ impl TxInner {
         let sz = BUCKET_HEADER_SIZE + inodes_size(true, &n.inodes);
         let mut value = vec![0u8; sz];
         b.header.write(&mut value[..BUCKET_HEADER_SIZE]);
-        write_inodes(&mut value[BUCKET_HEADER_SIZE..], true, &n.inodes);
+        let flat: Vec<Inode> = n.inodes.iter().cloned().collect();
+        write_inodes(&mut value[BUCKET_HEADER_SIZE..], true, &flat);
         value
     }
 

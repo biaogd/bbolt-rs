@@ -446,7 +446,10 @@ pub fn read_inodes(page: &[u8]) -> Vec<Inode> {
 }
 
 /// Serialized size of `inodes` on a leaf or branch page.
-pub fn inodes_size(is_leaf: bool, inodes: &[Inode]) -> usize {
+pub fn inodes_size<'a, I>(is_leaf: bool, inodes: I) -> usize
+where
+    I: IntoIterator<Item = &'a Inode>,
+{
     let elsz = if is_leaf {
         LEAF_PAGE_ELEMENT_SIZE
     } else {
@@ -461,7 +464,10 @@ pub fn inodes_size(is_leaf: bool, inodes: &[Inode]) -> usize {
 
 /// Upstream `node.sizeLessThan`: true iff serialized size is strictly below `limit`.
 /// Short-circuits as soon as the running size reaches `limit` (critical for spill of huge nodes).
-pub fn inodes_size_less_than(is_leaf: bool, inodes: &[Inode], limit: usize) -> bool {
+pub fn inodes_size_less_than<'a, I>(is_leaf: bool, inodes: I, limit: usize) -> bool
+where
+    I: IntoIterator<Item = &'a Inode>,
+{
     let elsz = if is_leaf {
         LEAF_PAGE_ELEMENT_SIZE
     } else {
