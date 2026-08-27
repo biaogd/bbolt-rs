@@ -35,23 +35,24 @@ Core operations and most of the public Go surface are implemented with on-disk f
 
 ## Upstream test suite coverage
 
-Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate ports the library-facing suite as faithfully as practical; each ported test cites the Go name in a comment or Rust test name (grep `Go:`).
+Go bbolt has ~283 `Test*` functions across ~46 `*_test.go` files. This crate maps **150+** of those names via `// Go: TestX` comments (grep `Go:`). `cargo test` runs ~200 library/CLI tests (a few large simulations are `#[ignore]`).
 
 | Upstream file | Status |
 | --- | --- |
-| `db_test.go` | Portable cases in `tests/db_test.rs` including open errors, size growth, batch-full, max-size reopen |
-| `bucket_test.go` | Portable cases in `tests/bucket_test.rs` including `Bucket::stats()` (Empty/Small/Nested) |
-| `tx_test.go` | Portable cases in `tests/tx_test.rs` including closed-tx errors and `TxStats::sub` |
-| `cursor_test.go` | Seek/delete/iterate plus seek-large, leaf-root-reverse, empty-page skips, `cursor.bucket()` |
-| `movebucket_test.go` | `tests/movebucket_test.rs` |
-| `tx_check_test.go` | `tests/tx_check_test.rs` |
-| `concurrent_test.go` | Simplified in `tests/concurrent_test.rs` |
-| `simulation_test.go` / `simulation_no_freelist_sync_test.go` | Through 1000op/10p in `tests/simulation_test.rs`; `100op_100p` and 10000op monsters `#[ignore]` |
-| `internal/freelist/*_test.go` | Unit tests in `src/freelist.rs` (including `free_freelist_alloctx`) |
-| `internal/common/page_test.go` | Covered in `src/page.rs` (`page_type_names`, `merge_pgids_*`) |
-| `node_test.go` | Leaf page read + split paths via `tests/node_test.rs` (node internals unexported) |
-| `cmd/bbolt/command/*_test.go` | Smoke coverage in `tests/cli_test.rs` (`keys`, `pages`, `inspect`, `stats`, …) |
-| failpoint / dmflakey / powerfailure / surgeon / Windows-only | **Skipped** (environment) |
+| `db_test.go` | Most portable cases in `tests/db_test.rs` (open errors, size, batch-full, max-size reopen, concurrent WriteTo) |
+| `bucket_test.go` | Most portable cases + `Bucket::stats()` Empty/Small/Nested; closed-tx Put/Delete/ForEach/NextSequence |
+| `tx_test.go` | Closed-tx errors, CopyFile, OnCommit, `TxStats::sub` |
+| `cursor_test.go` | Seek/delete/iterate, seek-large, leaf-root-reverse, empty-page skips, `cursor.bucket()` |
+| `movebucket_test.go` | Full table + DiffDB/DiffTx |
+| `tx_check_test.go` | Nest-bucket + corrupt page |
+| `concurrent_test.go` | Repeatable-read + generic R/W (simplified) |
+| `simulation_test.go` / `simulation_no_freelist_sync_test.go` | Through 1000op/10p (+ nfs 100op_10p); 100op_100p and 10000op monsters `#[ignore]` |
+| `internal/freelist/*_test.go` | Unit tests in `src/freelist.rs` (allocate/free/release/reload/write/read/rollback/init panics) |
+| `internal/common/page_test.go` | `page_type_names`, `merge_pgids` / `merge_pgids_quick` |
+| `node_test.go` | Leaf read/write + split MinKeys/SinglePage via bucket fills |
+| `db_whitebox_test.go` | PreLoadFreelist (+ allocate growth) |
+| `cmd/bbolt/command/*_test.go` | Smoke: version/info/buckets/keys/get/check/compact/pages/inspect/stats + no-args failures |
+| failpoint / dmflakey / powerfailure / surgeon / Windows-only / QuickCheck / multi-GB | **Skipped** (environment or extreme runtime) |
 
 Also: `tests/integration.rs` (format compatibility + feature smoke).
 

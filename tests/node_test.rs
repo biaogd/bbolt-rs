@@ -165,6 +165,7 @@ fn test_node_split_via_bucket() {
     .unwrap();
 }
 
+// Go: TestNode_split_MinKeys — few keys stay on a single leaf (no branch).
 #[test]
 fn test_node_split_min_keys_via_bucket() {
     let db = bbolt::Db::open(
@@ -194,6 +195,7 @@ fn test_node_split_min_keys_via_bucket() {
     .unwrap();
 }
 
+// Go: TestNode_split_SinglePage — modest fill remains a single leaf page.
 #[test]
 fn test_node_split_single_page_via_bucket() {
     let db = bbolt::Db::open(

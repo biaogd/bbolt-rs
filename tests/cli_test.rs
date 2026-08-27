@@ -221,3 +221,130 @@ fn cli_stats() {
     assert!(out.status.success(), "{:?}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("FreePageN"));
 }
+
+#[test]
+fn cli_info_command_run() {
+    // Go: TestInfoCommand_Run
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    {
+        let db = bbolt::Db::open(
+            &path,
+            0o600,
+            Some(bbolt::Options {
+                page_size: 4096,
+                ..bbolt::Options::default()
+            }),
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+    let out = bbolt_bin()
+        .args(["info", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("PageSize"));
+}
+
+#[test]
+fn cli_buckets_command_run() {
+    // Go: TestBucketsCommand_Run
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    {
+        let db = bbolt::Db::open(
+            &path,
+            0o600,
+            Some(bbolt::Options {
+                page_size: 4096,
+                ..bbolt::Options::default()
+            }),
+        )
+        .unwrap();
+        db.update(|tx| {
+            tx.create_bucket(b"foo")?;
+            tx.create_bucket(b"bar")?;
+            Ok(())
+        })
+        .unwrap();
+        db.close().unwrap();
+    }
+    let out = bbolt_bin()
+        .args(["buckets", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("foo"));
+    assert!(s.contains("bar"));
+}
+
+#[test]
+fn cli_get_command_run() {
+    // Go: TestGetCommand_Run
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    {
+        let db = bbolt::Db::open(
+            &path,
+            0o600,
+            Some(bbolt::Options {
+                page_size: 4096,
+                ..bbolt::Options::default()
+            }),
+        )
+        .unwrap();
+        db.update(|tx| {
+            tx.create_bucket(b"widgets")?.put(b"foo", b"bar")?;
+            Ok(())
+        })
+        .unwrap();
+        db.close().unwrap();
+    }
+    let out = bbolt_bin()
+        .args(["get", path.to_str().unwrap(), "widgets", "foo"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bar"));
+}
+
+#[test]
+fn cli_check_command_run() {
+    // Go: TestCheckCommand_Run
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    {
+        let db = bbolt::Db::open(
+            &path,
+            0o600,
+            Some(bbolt::Options {
+                page_size: 4096,
+                ..bbolt::Options::default()
+            }),
+        )
+        .unwrap();
+        db.update(|tx| {
+            tx.create_bucket(b"widgets")?.put(b"k", b"v")?;
+            Ok(())
+        })
+        .unwrap();
+        db.close().unwrap();
+    }
+    let out = bbolt_bin()
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OK"));
+}
+
+#[test]
+fn cli_no_args_fail() {
+    // Go: TestInfoCommand_NoArgs / TestGetCommand_NoArgs / TestPagesCommand_NoArgs (smoke)
+    for args in ["info", "get", "pages", "buckets", "check"] {
+        let out = bbolt_bin().arg(args).output().unwrap();
+        assert!(!out.status.success(), "expected failure for `{args}` with no path");
+    }
+}

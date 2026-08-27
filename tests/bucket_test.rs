@@ -790,10 +790,58 @@ fn test_bucket_stats_nested() {
 // Skipped: TestBucket_Get_FromNode — same as Put+Get in same tx (covered elsewhere).
 // Skipped: TestBucket_Get_Capacity — Go slice semantics.
 // Skipped: TestDB_Put_VeryLarge — long-running stress test (testing.Short).
-// Skipped: TestBucket_Put_Closed, TestBucket_Delete_Closed — closed tx via stale handle.
 // Skipped: TestBucket_Delete_FreelistOverflow — long stress test.
-// Skipped: TestBucket_Delete_ReadOnly — covered in errors_on_incompatible_and_readonly.
 // Skipped: TestBucket_DeleteBucket_Large — extended delete variant.
-// Skipped: TestBucket_NextSequence_Closed — closed tx.
-// Skipped: TestBucket_ForEach_Closed — edge cases.
 // Skipped: TestBucket_Stats, TestBucket_Stats_RandomFill, TestBucket_Stats_Large — long-running.
+
+// Go: TestBucket_Put_Closed
+#[test]
+fn test_bucket_put_closed() {
+    let (_dir, db) = common::open_tmp();
+    let tx = db.begin(true).unwrap();
+    let b = tx.create_bucket(b"widgets").unwrap();
+    tx.rollback().unwrap();
+    common::assert_err(b.put(b"foo", b"bar"), Error::TxClosed);
+}
+
+// Go: TestBucket_Delete_Closed
+#[test]
+fn test_bucket_delete_closed() {
+    let (_dir, db) = common::open_tmp();
+    db.update(|tx| {
+        tx.create_bucket(b"widgets")?.put(b"foo", b"bar")?;
+        Ok(())
+    })
+    .unwrap();
+    let tx = db.begin(true).unwrap();
+    let b = tx.bucket(b"widgets").unwrap();
+    tx.rollback().unwrap();
+    common::assert_err(b.delete(b"foo"), Error::TxClosed);
+}
+
+// Go: TestBucket_NextSequence_Closed
+#[test]
+fn test_bucket_next_sequence_closed() {
+    let (_dir, db) = common::open_tmp();
+    let tx = db.begin(true).unwrap();
+    let b = tx.create_bucket(b"widgets").unwrap();
+    tx.rollback().unwrap();
+    common::assert_err(b.next_sequence(), Error::TxClosed);
+}
+
+// Go: TestBucket_ForEach_Closed
+#[test]
+fn test_bucket_for_each_closed() {
+    let (_dir, db) = must_create();
+    db.update(|tx| {
+        let b = tx.create_bucket(b"widgets")?;
+        b.put(b"a", b"1")?;
+        Ok(())
+    })
+    .unwrap();
+    let tx = db.begin(false).unwrap();
+    let b = tx.bucket(b"widgets").unwrap();
+    tx.rollback().unwrap();
+    let err = b.for_each(|_, _| Ok(()));
+    common::assert_err(err, Error::TxClosed);
+}

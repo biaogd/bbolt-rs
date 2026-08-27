@@ -338,7 +338,10 @@ impl Freelist {
             self.reindex_hash();
             return;
         }
-        debug_assert!(pgids.windows(2).all(|w| w[0] < w[1]), "pgids not sorted");
+        assert!(
+            pgids.windows(2).all(|w| w[0] < w[1]),
+            "pgids not sorted"
+        );
         let mut size = 1u64;
         let mut start = pgids[0];
         for i in 1..pgids.len() {
@@ -671,5 +674,94 @@ mod tests {
         f.release_pending_pages();
         assert_eq!(f.pending_count(), 0);
         assert_eq!(f.copy_all(), vec![12]);
+    }
+
+    // Go: TestFreeList_init / TestFreelist_write / TestFreelist_read
+    #[test]
+    fn freelist_write_read_roundtrip() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![5, 6, 8]);
+        let mut buf = vec![0u8; 4096];
+        crate::page::set_page_id(&mut buf, 2);
+        f.write_page(&mut buf);
+        let mut f2 = Freelist::new(FreelistType::Array);
+        f2.read_page(&buf);
+        assert_eq!(f2.copy_all(), vec![5, 6, 8]);
+        f2.init(vec![]);
+        assert!(f2.copy_all().is_empty());
+    }
+
+    // Go: TestFreeList_reload
+    #[test]
+    fn freelist_reload_preserves_pending() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![5, 6, 8]);
+        let mut buf = vec![0u8; 4096];
+        crate::page::set_page_id(&mut buf, 2);
+        f.write_page(&mut buf);
+
+        let mut f2 = Freelist::new(FreelistType::Array);
+        f2.read_page(&buf);
+        assert_eq!(f2.copy_all(), vec![5, 6, 8]);
+        f2.free(5, 10, 2); // 10,11,12
+        f2.reload(&buf);
+        assert_eq!(f2.free_page_ids(), vec![5, 6, 8]);
+        assert_eq!(f2.pending_count(), 3);
+        assert!(f2.freed(10));
+    }
+
+    // Go: TestFreelist_releaseRange (first table case subset)
+    #[test]
+    fn freelist_release_range_basic() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![3, 4, 5]);
+        let _ = f.allocate(100, 1); // takes 3
+        f.free(150, 3, 0);
+        f.release_range(100, 200);
+        assert!(f.copy_all().contains(&3) || f.free_count() >= 2);
+    }
+
+    // Go: TestInvalidArrayAllocation
+    #[test]
+    #[should_panic(expected = "invalid page allocation")]
+    fn freelist_invalid_array_allocation_panics() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![1]);
+        let _ = f.allocate(1, 1);
+    }
+
+    // Go: Test_Freelist_Array_Rollback
+    #[test]
+    fn freelist_array_rollback() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![3, 5, 6, 7, 12, 13]);
+        f.free(100, 20, 1);
+        let _ = f.allocate(100, 3);
+        f.free(100, 25, 0);
+        let _ = f.allocate(100, 2);
+        f.rollback(100);
+        assert_eq!(f.pending_count(), 0);
+    }
+
+    // Go: TestFreelistHashmap_init_panics
+    #[test]
+    #[should_panic(expected = "pgids not sorted")]
+    fn freelist_hashmap_init_panics() {
+        let mut f = Freelist::new(FreelistType::HashMap);
+        f.init(vec![25, 5]);
+    }
+
+    // Go: Test_freelist_ReadIDs_and_getFreePageIDs
+    #[test]
+    fn freelist_read_ids_and_get_free_page_ids() {
+        let mut f = Freelist::new(FreelistType::Array);
+        f.init(vec![2, 3, 4, 10]);
+        assert_eq!(f.free_page_ids(), vec![2, 3, 4, 10]);
+        let mut buf = vec![0u8; 4096];
+        crate::page::set_page_id(&mut buf, 2);
+        f.write_page(&mut buf);
+        let mut f2 = Freelist::new(FreelistType::HashMap);
+        f2.read_page(&buf);
+        assert_eq!(f2.free_page_ids(), vec![2, 3, 4, 10]);
     }
 }

@@ -524,6 +524,7 @@ mod tests {
         assert_eq!(m1.checksum, 0x264c_351a_5179_480f);
     }
 
+    // Go: TestPgids_merge
     #[test]
     fn merge_pgids_union() {
         let a = vec![4, 5, 6, 10, 11, 12, 13, 27];
@@ -532,6 +533,35 @@ mod tests {
             merge_pgids(&a, &b),
             vec![1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 25, 27, 30]
         );
+    }
+
+    // Go: TestPgids_merge_quick (property: merge equals sorted concat; may keep dupes)
+    #[test]
+    fn merge_pgids_quick() {
+        for _ in 0..200 {
+            let mut a: Vec<u64> = (0..20).map(|_| fastrand_u64(50)).collect();
+            let mut b: Vec<u64> = (0..20).map(|_| fastrand_u64(50)).collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            let m = merge_pgids(&a, &b);
+            let mut exp = a.clone();
+            exp.extend_from_slice(&b);
+            exp.sort_unstable();
+            assert_eq!(m, exp);
+        }
+    }
+
+    fn fastrand_u64(n: u64) -> u64 {
+        use std::cell::Cell;
+        thread_local! {
+            static S: Cell<u64> = const { Cell::new(0x9e37_79b9_7f4a_7c15) };
+        }
+        S.with(|s| {
+            let mut x = s.get();
+            x = x.wrapping_mul(0x2545_f491_4f6c_dd1d).wrapping_add(1);
+            s.set(x);
+            x % n.max(1)
+        })
     }
 
     #[test]
@@ -565,6 +595,7 @@ mod tests {
         assert_eq!(key, b"nested");
     }
 
+    // Go: TestPage_typ
     #[test]
     fn page_type_names() {
         assert_eq!(

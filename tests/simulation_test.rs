@@ -357,6 +357,21 @@ fn test_simulate_no_freelist_sync_10op_10p() {
 }
 
 #[test]
+fn test_simulate_no_freelist_sync_100op_10p() {
+    // Go: TestSimulateNoFreeListSync_100op_10p
+    test_simulate(
+        Options {
+            no_freelist_sync: true,
+            page_size: 4096,
+            ..Options::default()
+        },
+        1,
+        100,
+        10,
+    );
+}
+
+#[test]
 fn test_simulate_no_freelist_sync_1000op_1p() {
     // Go: TestSimulateNoFreeListSync_1000op_1p
     test_simulate(

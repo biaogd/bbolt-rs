@@ -267,6 +267,7 @@ impl TxInner {
         stack: &mut Vec<ElemRef>,
         key: &[u8],
     ) -> Result<Kv> {
+        self.check_open()?;
         stack.clear();
         let root = self.buckets[&bid].header.root;
         self.search(bid, stack, key, root)?;
@@ -545,6 +546,7 @@ impl TxInner {
     }
 
     pub fn cursor_first(&mut self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<Kv> {
+        self.check_open()?;
         stack.clear();
         let root = self.buckets[&bid].header.root;
         match self.page_node(bid, root)? {
@@ -569,6 +571,7 @@ impl TxInner {
     }
 
     pub fn cursor_last(&mut self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<Kv> {
+        self.check_open()?;
         stack.clear();
         let root = self.buckets[&bid].header.root;
         match self.page_node(bid, root)? {
