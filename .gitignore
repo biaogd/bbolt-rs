@@ -4,3 +4,5 @@
 .vscode/
 *.db
 !tests/fixtures/*.db
+/bench-data/
+/bench-data-smoke/

@@ -133,6 +133,15 @@ cargo clippy --all-targets -- -D warnings
 
 Integration coverage includes create/open, put/get/delete, nested buckets, cursors, commit/rollback, sequences, splits/overflow, batch, Go fixtures, **hashmap freelist**, **NoFreelistSync recovery**, **check**, **compact**, and **WriteTo/CopyFile**.
 
+## Performance vs Go bbolt
+
+See **[BENCHMARKS.md](BENCHMARKS.md)** for an apples-to-apples comparison against `go.etcd.io/bbolt` v1.5.0 on this VM (same page size, freelist array, fsync defaults). Summary: Rust is competitive on **random put** and within ~2× on random get / many small txns, but currently much slower on **sequential bulk put** and **cursor scan** (gap remains with `NoSync`, so it is not an accidental fsync mismatch).
+
+```sh
+./benches/run_compare.sh
+cargo run --release --bin bench_compare -- --dir /tmp/r --workload seq_put --n 100000
+```
+
 ## Compatibility with upstream bbolt
 
 **On-disk format (version 2)** — intended to match:
