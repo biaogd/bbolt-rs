@@ -545,7 +545,10 @@ fn test_tx_copy_file_error_normal() {
 // Go: TestTx_releaseRange
 #[test]
 fn test_tx_release_range() {
+    #[cfg(unix)]
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    #[cfg(windows)]
+    let page_size = 4096usize;
     let (_dir, db) = common::open_tmp_with(bbolt::Options {
         initial_mmap_size: page_size * 100,
         page_size: common::PAGE_SIZE,

@@ -47,7 +47,7 @@ pub fn flock(file: &File, exclusive: bool, timeout: Option<Duration>) -> Result<
             Internal: 0,
             InternalHigh: 0,
             Anonymous: unsafe { std::mem::zeroed() },
-            hEvent: 0,
+            hEvent: std::ptr::null_mut(),
         };
         // SAFETY: OVERLAPPED Offset/OffsetHigh layout via Anonymous union.
         unsafe {
@@ -90,7 +90,7 @@ pub fn funlock(file: &File) -> Result<()> {
         Internal: 0,
         InternalHigh: 0,
         Anonymous: unsafe { std::mem::zeroed() },
-        hEvent: 0,
+        hEvent: std::ptr::null_mut(),
     };
     unsafe {
         let parts = &mut overlapped.Anonymous as *mut _ as *mut u32;
