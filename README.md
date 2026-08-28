@@ -135,7 +135,15 @@ Integration coverage includes create/open, put/get/delete, nested buckets, curso
 
 ## Performance vs Go bbolt
 
-See **[BENCHMARKS.md](BENCHMARKS.md)** for an apples-to-apples comparison against `go.etcd.io/bbolt` v1.5.0 on this VM (same page size, freelist array, fsync defaults). Summary: Rust is **ahead** on seq_put (~2.7×), deletes (~2.1×), cursor_scan (~1.3×), random_get (~1.3×), random_put (~10×), and large_value (~2×); `many_small_tx` stays fsync-bound (~0.9×).
+Same cloud VM, `n=100000`, key=8, value=32, page=4096, fsync on, fill 0.5, 1 warmup + 5 trials (median). [ambaxter/bbolt-rs](https://github.com/ambaxter/bbolt-rs) targets Bolt **v1.3.10** on-disk (not interchangeable with this **v1.5.0** port); their published MacBook numbers use a different harness. See **[BENCHMARKS.md](BENCHMARKS.md)** for the fuller two-way vs-Go table (e.g. seq_put **2.70×** from a separate run).
+
+| Workload | Go (bbolt v1.5.0) | this crate | ambaxter/bbolt-rs 1.3.10 | this/Go | bbolt-rs/Go | this/bbolt-rs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| seq_put | 846,040 | 2,183,226 | 1,223,120 | 2.58× | 1.45× | 1.78× |
+| random_put | 4,865 | 51,332 | 24,820 | 10.55× | 5.10× | 2.07× |
+| cursor_scan | 83,133,812 | 100,702,399 | 97,322,654 | 1.21× | 1.17× | 1.03× |
+| random_get | 2,592,914 | 3,252,083 | 2,110,585 | 1.25× | 0.81× | 1.54× |
+| deletes | 2,907,090 | 6,414,485 | 3,130,763 | 2.21× | 1.08× | 2.05× |
 
 ```sh
 ./benches/run_compare.sh
