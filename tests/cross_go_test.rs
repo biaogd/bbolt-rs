@@ -327,29 +327,41 @@ fn fresh_init_bytes_match_go() {
     }
     let go_bytes = fs::read(&go_path).unwrap();
     let rust_bytes = fs::read(&rust_path).unwrap();
-    assert_eq!(
-        go_bytes.len(),
-        rust_bytes.len(),
-        "init size diverge: go={} rust={}",
-        go_bytes.len(),
+    let fixture = fs::read("tests/fixtures/go_init.db").unwrap();
+    // Logical empty DB is 4 pages. On Windows, Go truncates the file to the
+    // mmap size (min 32KiB) so the on-disk file can be larger; extra bytes
+    // must be zeros and are not part of the page layout.
+    let logical = PAGE * 4;
+    assert_eq!(fixture.len(), logical, "fixture must be 4 pages");
+    assert!(
+        go_bytes.len() >= logical,
+        "go init too small: {}",
+        go_bytes.len()
+    );
+    assert!(
+        rust_bytes.len() >= logical,
+        "rust init too small: {}",
         rust_bytes.len()
     );
-    if go_bytes != rust_bytes {
-        let mut diffs = Vec::new();
-        for (i, (a, b)) in go_bytes.iter().zip(rust_bytes.iter()).enumerate() {
-            if a != b {
-                diffs.push(i);
-                if diffs.len() >= 16 {
-                    break;
-                }
-            }
-        }
-        panic!("fresh init byte divergence at offsets {diffs:?}");
-    }
-    let fixture = fs::read("tests/fixtures/go_init.db").unwrap();
     assert_eq!(
-        rust_bytes, fixture,
+        &go_bytes[..logical],
+        &rust_bytes[..logical],
+        "logical init pages diverge"
+    );
+    assert_eq!(
+        &rust_bytes[..logical],
+        fixture.as_slice(),
         "Rust init must match tests/fixtures/go_init.db"
+    );
+    assert!(
+        go_bytes[logical..].iter().all(|&b| b == 0),
+        "go mmap tail is not zeros (len={})",
+        go_bytes.len()
+    );
+    assert!(
+        rust_bytes[logical..].iter().all(|&b| b == 0),
+        "rust mmap tail is not zeros (len={})",
+        rust_bytes.len()
     );
 }
 
