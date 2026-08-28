@@ -64,12 +64,36 @@ pub fn funlock(file: &File) -> Result<()> {
 }
 
 pub fn fdatasync(file: &File) -> Result<()> {
+    fdatasync_impl(file)
+}
+
+/// Linux/Android: POSIX fdatasync (matches Go boltsync_linux.go).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fdatasync_impl(file: &File) -> Result<()> {
     // SAFETY: `file` is an open fd.
     let rc = unsafe { libc::fdatasync(file.as_raw_fd()) };
     if rc != 0 {
         return Err(Error::io("<fdatasync>", std::io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// Darwin: fcntl(F_FULLFSYNC), matching Go os.File.Sync() on macOS.
+#[cfg(target_os = "macos")]
+fn fdatasync_impl(file: &File) -> Result<()> {
+    // SAFETY: `file` is an open fd; F_FULLFSYNC takes no extra arg.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+    if rc != 0 {
+        return Err(Error::io("<F_FULLFSYNC>", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Other Unix: fsync via std (Go boltsync_unix.go uses file.Sync()).
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn fdatasync_impl(file: &File) -> Result<()> {
+    file.sync_all()
+        .map_err(|e| Error::io("<File::sync_all>", e))
 }
 
 pub fn map_file(file: &File, path: &Path, len: usize, _mmap_flags: i32) -> Result<Mmap> {
