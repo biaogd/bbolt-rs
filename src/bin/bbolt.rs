@@ -1,5 +1,9 @@
 //! `bbolt` CLI — subset of upstream `cmd/bbolt` commands.
 
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -111,13 +115,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Keys { path, buckets } => {
             let db = open_ro(&path)?;
             db.view(|tx| {
-                let mut b = None;
+                let mut b: Option<bbolt::Bucket> = None;
                 for (i, name) in buckets.iter().enumerate() {
                     let next = if i == 0 {
-                        tx.bucket(name.as_bytes())
+                        tx.bucket(name.as_bytes())?
                     } else {
-                        b.as_ref()
-                            .and_then(|bb: &bbolt::Bucket| bb.bucket(name.as_bytes()))
+                        b.as_ref().ok_or(bbolt::Error::BucketNotFound)?
+                            .bucket(name.as_bytes())?
                     };
                     b = Some(next.ok_or(bbolt::Error::BucketNotFound)?);
                 }
@@ -137,14 +141,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let db = open_ro(&path)?;
             db.view(|tx| {
                 let mut b = tx
-                    .bucket(buckets[0].as_bytes())
+                    .bucket(buckets[0].as_bytes())?
                     .ok_or(bbolt::Error::BucketNotFound)?;
                 for name in &buckets[1..] {
                     b = b
-                        .bucket(name.as_bytes())
+                        .bucket(name.as_bytes())?
                         .ok_or(bbolt::Error::BucketNotFound)?;
                 }
-                match b.get(key.as_bytes()) {
+                match b.get(key.as_bytes())? {
                     Some(v) => {
                         io::stdout()
                             .write_all(&v)

@@ -39,13 +39,13 @@ fn test_node_leaf_page_roundtrip() {
         },
     ];
     write_inodes(&mut page, true, &inodes);
-    let got = read_inodes(&page);
+    let got = read_inodes(&page).unwrap();
     assert_eq!(got.len(), 3);
     assert_eq!(got[0].key, b"john");
     assert_eq!(got[0].value, b"johnson");
     assert_eq!(got[1].key, b"ricki");
     assert_eq!(got[2].key, b"susy");
-    let (_f, k, v) = leaf_at(&page, 0);
+    let (_f, k, v) = leaf_at(&page, 0).unwrap();
     assert_eq!(k, b"john");
     assert_eq!(v, b"johnson");
     let _ = PAGE_HEADER_SIZE;
@@ -82,7 +82,7 @@ fn test_node_put_sorted_overwrite() {
         inodes[i].flags = LEAF_PAGE_FLAG as u32;
     }
     write_inodes(&mut page, true, &inodes);
-    let got = read_inodes(&page);
+    let got = read_inodes(&page).unwrap();
     assert_eq!(got.len(), 3);
     assert_eq!(got[0].key, b"bar");
     assert_eq!(got[1].key, b"baz");
@@ -121,7 +121,7 @@ fn test_node_read_leaf_page() {
     let data_start = PAGE_HEADER_SIZE + 2 * LEAF_PAGE_ELEMENT_SIZE;
     page[data_start..data_start + 20].copy_from_slice(b"barfoozhelloworldbye");
 
-    let got = read_inodes(&page);
+    let got = read_inodes(&page).unwrap();
     assert_eq!(got.len(), 2);
     assert_eq!(got[0].key, b"bar");
     assert_eq!(got[0].value, b"fooz");
@@ -152,10 +152,10 @@ fn test_node_split_via_bucket() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"data").unwrap();
+        let b = tx.bucket(b"data").unwrap().unwrap();
         for i in 1..=5u8 {
             let key = format!("{i:08}");
-            assert_eq!(b.get(key.as_bytes()).as_deref(), Some(val as &[u8]));
+            assert_eq!(b.get(key.as_bytes()).unwrap().as_deref(), Some(val as &[u8]));
         }
         let stats = b.stats();
         assert!(stats.depth >= 1);
@@ -187,7 +187,7 @@ fn test_node_split_min_keys_via_bucket() {
     })
     .unwrap();
     db.view(|tx| {
-        let stats = tx.bucket(b"data").unwrap().stats();
+        let stats = tx.bucket(b"data").unwrap().unwrap().stats();
         assert_eq!(stats.key_n, 2);
         assert_eq!(stats.branch_page_n, 0);
         Ok(())
@@ -216,7 +216,7 @@ fn test_node_split_single_page_via_bucket() {
     })
     .unwrap();
     db.view(|tx| {
-        let stats = tx.bucket(b"data").unwrap().stats();
+        let stats = tx.bucket(b"data").unwrap().unwrap().stats();
         assert_eq!(stats.key_n, 5);
         assert_eq!(stats.branch_page_n, 0);
         Ok(())

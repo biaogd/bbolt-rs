@@ -7,6 +7,16 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("batch commit failed: {0}")]
+    BatchFailed(#[source] std::sync::Arc<Error>),
+    #[error("database requires close and reopen after a failed commit")]
+    RecoveryRequired,
+    #[error("commit outcome is uncertain; close and reopen database: {0}")]
+    CommitUncertain(#[source] Box<Error>),
+    #[error(
+        "transaction committed to disk, but mmap recovery failed; close and reopen database: {0}"
+    )]
+    CommittedMappingFailed(#[source] Box<Error>),
     #[error("database not open")]
     DatabaseNotOpen,
     #[error("invalid database")]

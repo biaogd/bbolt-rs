@@ -30,7 +30,7 @@ Apples-to-apples workloads on the **same cloud VM**, same options, same on-disk 
 ./benches/run_compare.sh
 
 # Or single shot:
-cargo build --release --bin bench_compare
+cargo build --release --features cli,jemalloc --bin bench_compare
 (cd benches/go && GOTOOLCHAIN=auto go build -o go-bench .)
 
 ./benches/go/go-bench -dir /tmp/g -workload seq_put -n 100000 -key-size 8 -value-size 32

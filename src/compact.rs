@@ -29,12 +29,12 @@ pub fn compact(dst: &Db, src: &Db, tx_max_size: i64) -> Result<()> {
         }
 
         let b0 = tx
-            .bucket(&keys[0])
+            .bucket(&keys[0])?
             .ok_or(crate::error::Error::BucketNotFound)?;
         let mut b = b0;
         if nk > 1 {
             for part in &keys[1..] {
-                b = b.bucket(part).ok_or(crate::error::Error::BucketNotFound)?;
+                b = b.bucket(part)?.ok_or(crate::error::Error::BucketNotFound)?;
             }
         }
         b.set_fill_percent(1.0);
@@ -112,7 +112,7 @@ fn walk_bucket(
     path.push(k.to_vec());
     b.for_each(|ck, cv| {
         if cv.is_none() {
-            let bkt = b.bucket(ck).ok_or(crate::error::Error::BucketNotFound)?;
+            let bkt = b.bucket(ck)?.ok_or(crate::error::Error::BucketNotFound)?;
             walk_bucket(&bkt, &path, ck, None, bkt.sequence(), fn_)
         } else {
             walk_bucket(b, &path, ck, cv, b.sequence(), fn_)

@@ -76,7 +76,7 @@ fn rust_inspect(db: &Db) -> DumpDb {
         })?;
         names.sort();
         for name in names {
-            let b = tx.bucket(&name).unwrap();
+            let b = tx.bucket(&name).unwrap().unwrap();
             buckets.push(dump_bucket(&b, &hx(&name)));
         }
         Ok(())
@@ -91,7 +91,7 @@ fn dump_bucket(b: &bbolt::Bucket, name: &str) -> DumpBucket {
     b.for_each(|k, v| {
         match v {
             None => {
-                let sub = b.bucket(k).expect("nested bucket");
+                let sub = b.bucket(k).unwrap().expect("nested bucket");
                 nested.push(dump_bucket(&sub, &hx(k)));
             }
             Some(val) => keys.push(DumpKv {
@@ -238,7 +238,7 @@ fn apply_rust_scenario(db: &Db, scenario: &str) {
             })
             .unwrap();
             db.update(|tx| {
-                let b = tx.bucket(b"del").unwrap();
+                let b = tx.bucket(b"del").unwrap().unwrap();
                 for i in (0..200).step_by(2) {
                     b.delete(format!("{i:04}").as_bytes())?;
                 }
@@ -297,7 +297,7 @@ fn mutate_rust(path: &Path, scenario: &str, freelist: FreelistType) {
         }
         "delete_alice" => {
             db.update(|tx| {
-                tx.bucket(b"users").unwrap().delete(b"alice")?;
+                tx.bucket(b"users").unwrap().unwrap().delete(b"alice")?;
                 Ok(())
             })
             .unwrap();
@@ -438,11 +438,11 @@ fn round_trip_go_rust_go() {
     let rust_json = {
         let db = open_rust(&path, FreelistType::Array);
         db.view(|tx| {
-            let u = tx.bucket(b"users").unwrap();
-            assert!(u.get(b"alice").is_none());
-            assert_eq!(u.get(b"bob").as_deref(), Some(&b"data2"[..]));
-            assert_eq!(u.get(b"carol").as_deref(), Some(&b"data3"[..]));
-            assert_eq!(u.get(b"dave").as_deref(), Some(&b"data4"[..]));
+            let u = tx.bucket(b"users").unwrap().unwrap();
+            assert!(u.get(b"alice").unwrap().is_none());
+            assert_eq!(u.get(b"bob").unwrap().as_deref(), Some(&b"data2"[..]));
+            assert_eq!(u.get(b"carol").unwrap().as_deref(), Some(&b"data3"[..]));
+            assert_eq!(u.get(b"dave").unwrap().as_deref(), Some(&b"data4"[..]));
             Ok(())
         })
         .unwrap();
@@ -464,9 +464,9 @@ fn round_trip_rust_go_rust() {
     let rust_json = {
         let db = open_rust(&path, FreelistType::Array);
         db.view(|tx| {
-            let u = tx.bucket(b"users").unwrap();
-            assert!(u.get(b"alice").is_none());
-            assert_eq!(u.get(b"carol").as_deref(), Some(&b"data3"[..]));
+            let u = tx.bucket(b"users").unwrap().unwrap();
+            assert!(u.get(b"alice").unwrap().is_none());
+            assert_eq!(u.get(b"carol").unwrap().as_deref(), Some(&b"data3"[..]));
             Ok(())
         })
         .unwrap();
@@ -553,7 +553,7 @@ fn behavioral_cursor_order_and_errors() {
     go_write(&path, "split", PAGE, "array");
     let db = open_rust(&path, FreelistType::Array);
     db.view(|tx| {
-        let b = tx.bucket(b"split").unwrap();
+        let b = tx.bucket(b"split").unwrap().unwrap();
         let mut c = b.cursor();
         let mut prev: Option<Vec<u8>> = None;
         let mut kv = c.first()?;
@@ -596,7 +596,7 @@ fn behavioral_cursor_order_and_errors() {
         tx.rollback().unwrap();
     }
     db.view(|tx| {
-        assert!(tx.bucket(b"gone").is_none());
+        assert!(tx.bucket(b"gone").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -612,7 +612,7 @@ fn behavioral_cursor_order_and_errors() {
     {
         let db = open_rust(&path, FreelistType::Array);
         db.view(|tx| {
-            assert_eq!(tx.bucket(b"seq2").unwrap().sequence(), 42);
+            assert_eq!(tx.bucket(b"seq2").unwrap().unwrap().sequence(), 42);
             Ok(())
         })
         .unwrap();
@@ -651,9 +651,9 @@ fn go_incompatible_scenario_matches_rust() {
     go_write(&path, "incompatible_put", PAGE, "array");
     let db = open_rust(&path, FreelistType::Array);
     db.view(|tx| {
-        let w = tx.bucket(b"widgets").unwrap();
-        assert!(w.bucket(b"sub").is_some());
-        assert!(w.get(b"sub").is_none());
+        let w = tx.bucket(b"widgets").unwrap().unwrap();
+        assert!(w.bucket(b"sub").unwrap().is_some());
+        assert!(w.get(b"sub").unwrap().is_none());
         Ok(())
     })
     .unwrap();

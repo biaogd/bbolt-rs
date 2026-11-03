@@ -13,16 +13,12 @@
 //!     Ok(())
 //! })?;
 //! db.view(|tx| {
-//!     let b = tx.bucket(b"users").unwrap();
-//!     assert_eq!(b.get(b"alice").as_deref(), Some(&b"data"[..]));
+//!     let b = tx.bucket(b"users")?.unwrap();
+//!     assert_eq!(b.get(b"alice")?.as_deref(), Some(&b"data"[..]));
 //!     Ok(())
 //! })?;
 //! # Ok::<(), bbolt::Error>(())
 //! ```
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod batch;
 mod bucket;
@@ -46,11 +42,14 @@ pub use cursor::{Cursor, KeyValue};
 pub use db::{Db, Options};
 pub use error::{Error, Result};
 pub use freelist::FreelistType;
-pub use page::{DEFAULT_FILL_PERCENT, MAGIC, MAX_KEY_SIZE, MAX_VALUE_SIZE, VERSION};
 pub use page::{
-    branch_at, leaf_at, meta_from_page, read_inodes, write_inodes, write_meta_page, Inode,
-    Meta, PageHeader, Pgid, Txid, BRANCH_PAGE_FLAG, LEAF_PAGE_ELEMENT_SIZE, LEAF_PAGE_FLAG,
+    branch_at, branch_pgid, leaf_at, meta_from_page, read_inodes, write_inodes, write_meta_page,
+    Inode, Meta, PageHeader, Pgid, Txid, BRANCH_PAGE_FLAG, LEAF_PAGE_ELEMENT_SIZE, LEAF_PAGE_FLAG,
     PAGE_HEADER_SIZE,
 };
+pub use page::{DEFAULT_FILL_PERCENT, MAGIC, MAX_KEY_SIZE, MAX_VALUE_SIZE, VERSION};
 pub use stats::{BucketStats, BucketStructure, Info, PageInfo, Stats, TxStats};
 pub use tx::Tx;
+
+#[cfg(test)]
+mod recovery_tests;

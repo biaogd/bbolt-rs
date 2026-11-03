@@ -18,7 +18,7 @@ fn test_cursor_seek() {
     })
     .unwrap();
     db.view(|tx| {
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let (k, v) = c.seek(b"bar").unwrap();
         assert_eq!(k.as_deref(), Some(&b"bar"[..]));
         assert_eq!(v.as_deref(), Some(&b"0002"[..]));
@@ -58,7 +58,7 @@ fn test_cursor_delete() {
     })
     .unwrap();
     db.update(|tx| {
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let bound = (COUNT / 2).to_be_bytes();
         loop {
             let (k, _) = c.first().unwrap();
@@ -74,7 +74,7 @@ fn test_cursor_delete() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         let mut n = 0;
         b.for_each(|_k, v| {
             if v.is_some() {
@@ -83,7 +83,7 @@ fn test_cursor_delete() {
             Ok(())
         })?;
         assert_eq!(n, (COUNT / 2) as usize);
-        assert!(b.bucket(b"sub").is_some());
+        assert!(b.bucket(b"sub").unwrap().is_some());
         Ok(())
     })
     .unwrap();
@@ -99,7 +99,7 @@ fn test_cursor_empty_bucket() {
     })
     .unwrap();
     db.view(|tx| {
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let (k, v) = c.first().unwrap();
         assert!(k.is_none());
         assert!(v.is_none());
@@ -118,7 +118,7 @@ fn test_cursor_empty_bucket_reverse() {
     })
     .unwrap();
     db.view(|tx| {
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let (k, v) = c.last().unwrap();
         assert!(k.is_none());
         assert!(v.is_none());
@@ -140,7 +140,7 @@ fn test_cursor_iterate_leaf() {
     })
     .unwrap();
     let tx = db.begin(false).unwrap();
-    let mut c = tx.bucket(b"widgets").unwrap().cursor();
+    let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
     let (k, v) = c.first().unwrap();
     assert_eq!(k.as_deref(), Some(&b"bar"[..]));
     assert_eq!(v.as_deref(), Some(&[1][..]));
@@ -169,7 +169,7 @@ fn test_cursor_seek_on_populated_bucket() {
     })
     .unwrap();
     db.view(|tx| {
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let (k, _) = c.seek(b"025").unwrap();
         assert_eq!(k.as_deref(), Some(&b"025"[..]));
         while c.next().unwrap().0.is_some() {}
@@ -193,7 +193,7 @@ fn test_cursor_first_last_basics() {
     })
     .unwrap();
     db.view(|tx| {
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let (k, _) = c.first().unwrap();
         assert_eq!(k.as_deref(), Some(&b"a"[..]));
         let (k, _) = c.last().unwrap();
@@ -223,7 +223,7 @@ fn test_cursor_seek_large() {
     })
     .unwrap();
     db.view(|tx| {
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         for i in 0..COUNT {
             let seek = i.to_be_bytes();
             let (k, _) = c.seek(&seek).unwrap();
@@ -256,7 +256,7 @@ fn test_cursor_leaf_root_reverse() {
     })
     .unwrap();
     let tx = db.begin(false).unwrap();
-    let mut c = tx.bucket(b"widgets").unwrap().cursor();
+    let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
     let (k, v) = c.last().unwrap();
     assert_eq!(k.as_deref(), Some(&b"foo"[..]));
     assert_eq!(v.as_deref(), Some(&[0][..]));
@@ -285,7 +285,7 @@ fn test_cursor_first_empty_pages() {
     })
     .unwrap();
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 0..600u64 {
             b.delete(&i.to_be_bytes())?;
         }
@@ -315,7 +315,7 @@ fn test_cursor_last_empty_pages() {
     })
     .unwrap();
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 200..1000u64 {
             b.delete(&i.to_be_bytes())?;
         }
@@ -341,7 +341,7 @@ fn test_cursor_bucket() {
         b.put(b"a", b"1")?;
         let c = b.cursor();
         let cb = c.bucket();
-        assert_eq!(cb.get(b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(cb.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
         Ok(())
     })
     .unwrap();
@@ -391,7 +391,7 @@ fn test_cursor_quick_check() {
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
         db.view(|tx| {
-            let mut c = tx.bucket(b"widgets").unwrap().cursor();
+            let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
             let mut index = 0;
             let mut kv = c.first().unwrap();
             while kv.0.is_some() && index < sorted.len() {
@@ -427,7 +427,7 @@ fn test_cursor_quick_check_reverse() {
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
 
         db.view(|tx| {
-            let mut c = tx.bucket(b"widgets").unwrap().cursor();
+            let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
             let mut index = 0;
             let mut kv = c.last().unwrap();
             while kv.0.is_some() && index < sorted.len() {
@@ -457,7 +457,7 @@ fn test_cursor_quick_check_buckets_only() {
     .unwrap();
     db.view(|tx| {
         let mut names = Vec::new();
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let mut kv = c.first().unwrap();
         while let Some(k) = kv.0 {
             names.push(String::from_utf8(k).unwrap());
@@ -484,7 +484,7 @@ fn test_cursor_quick_check_buckets_only_reverse() {
     .unwrap();
     db.view(|tx| {
         let mut names = Vec::new();
-        let mut c = tx.bucket(b"widgets").unwrap().cursor();
+        let mut c = tx.bucket(b"widgets").unwrap().unwrap().cursor();
         let mut kv = c.last().unwrap();
         while let Some(k) = kv.0 {
             names.push(String::from_utf8(k).unwrap());

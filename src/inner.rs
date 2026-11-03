@@ -7,14 +7,13 @@ use memmap2::Mmap;
 
 use crate::db::DbInner;
 use crate::error::{Error, Result};
-use crate::stats::TxStats;
 use crate::page::{
     branch_at, branch_pgid, inodes_size, inodes_size_less_than, leaf_at, read_inodes, write_inodes,
-    write_meta_page,
-    InBucket, Inode, Meta, PageHeader, Pgid, BUCKET_HEADER_SIZE, BUCKET_LEAF_FLAG,
+    write_meta_page, InBucket, Inode, Meta, PageHeader, Pgid, BUCKET_HEADER_SIZE, BUCKET_LEAF_FLAG,
     DEFAULT_FILL_PERCENT, LEAF_PAGE_FLAG, MAX_FILL_PERCENT, MAX_KEY_SIZE, MAX_VALUE_SIZE,
     MIN_FILL_PERCENT, MIN_KEYS_PER_PAGE, PAGE_HEADER_SIZE, PGID_NO_FREELIST,
 };
+use crate::stats::TxStats;
 
 pub type BucketId = u64;
 pub type NodeId = u64;
@@ -303,7 +302,7 @@ impl TxInner {
             self.read_page(pgid)?
         };
         let hdr = PageHeader::read(&page);
-        let inodes: VecDeque<Inode> = read_inodes(&page).into();
+        let inodes: VecDeque<Inode> = read_inodes(&page)?.into();
         let b = self.buckets.get_mut(&bid).unwrap();
         let id = b.alloc_node();
         let key = inodes.front().map(|i| i.key.clone()).unwrap_or_default();
@@ -505,14 +504,17 @@ impl TxInner {
                     };
                     let hdr = PageHeader::read(page);
                     if !hdr.is_branch() && !hdr.is_leaf() {
-                        panic!("invalid page type: {}: {:x}", hdr.id, hdr.flags);
+                        return Err(Error::Corrupt(format!(
+                            "invalid page type: {}: {:x}",
+                            hdr.id, hdr.flags
+                        )));
                     }
                     stack.last_mut().unwrap().count = hdr.count as i32;
                     if hdr.is_leaf() {
-                        nsearch_page(stack, page, key);
+                        nsearch_page(stack, page, key)?;
                         (true, 0)
                     } else {
-                        let child = search_page_index(stack, page, key);
+                        let child = search_page_index(stack, page, key)?;
                         (false, child)
                     }
                 };
@@ -531,10 +533,10 @@ impl TxInner {
                     let hdr = PageHeader::read(page);
                     stack.last_mut().unwrap().count = hdr.count as i32;
                     if hdr.is_leaf() {
-                        nsearch_page(stack, page, key);
+                        nsearch_page(stack, page, key)?;
                         None
                     } else {
-                        Some(search_page_index(stack, page, key))
+                        Some(search_page_index(stack, page, key)?)
                     }
                 };
                 if let Some(child) = child {
@@ -655,7 +657,7 @@ impl TxInner {
         }
         if self.buckets[&bid].header.root == 0 {
             let page_ref = self.buckets[&bid].inline_page.as_ref().unwrap();
-            let (flags, key, val) = leaf_at(page_ref, r.index);
+            let (flags, key, val) = leaf_at(page_ref, r.index)?;
             key_buf.extend_from_slice(key);
             let has_val = flags & BUCKET_LEAF_FLAG == 0;
             if has_val {
@@ -664,14 +666,14 @@ impl TxInner {
             return Ok((true, flags, has_val));
         }
         self.with_page(r.pgid, |page_ref| {
-            let (flags, key, val) = leaf_at(page_ref, r.index);
+            let (flags, key, val) = leaf_at(page_ref, r.index)?;
             key_buf.extend_from_slice(key);
             let has_val = flags & BUCKET_LEAF_FLAG == 0;
             if has_val {
                 val_buf.extend_from_slice(val);
             }
-            (true, flags, has_val)
-        })
+            Ok((true, flags, has_val))
+        })?
     }
 
     /// Raw key/value including bucket payload (for open_bucket).
@@ -693,13 +695,13 @@ impl TxInner {
         }
         if self.buckets[&bid].header.root == 0 {
             let page_ref = self.buckets[&bid].inline_page.as_ref().unwrap();
-            let (flags, key, val) = leaf_at(page_ref, r.index);
+            let (flags, key, val) = leaf_at(page_ref, r.index)?;
             return Ok((Some(key.to_vec()), Some(val.to_vec()), flags));
         }
         self.with_page(r.pgid, |page_ref| {
-            let (flags, key, val) = leaf_at(page_ref, r.index);
-            (Some(key.to_vec()), Some(val.to_vec()), flags)
-        })
+            let (flags, key, val) = leaf_at(page_ref, r.index)?;
+            Ok((Some(key.to_vec()), Some(val.to_vec()), flags))
+        })?
     }
 
     fn go_to_first(&self, bid: BucketId, stack: &mut Vec<ElemRef>) -> Result<()> {
@@ -740,9 +742,9 @@ impl TxInner {
             Ok(self.buckets[&bid].nodes[&id].inodes[r.index].pgid)
         } else if self.buckets[&bid].header.root == 0 {
             let page = self.buckets[&bid].inline_page.as_ref().unwrap();
-            Ok(branch_pgid(page, r.index))
+            branch_pgid(page, r.index)
         } else {
-            self.with_page(r.pgid, |page| branch_pgid(page, r.index))
+            self.with_page(r.pgid, |page| branch_pgid(page, r.index))?
         }
     }
 
@@ -796,12 +798,7 @@ impl TxInner {
         match self.page_node(bid, root)? {
             PageNode::Node(id) => {
                 let count = self.buckets[&bid].nodes[&id].inodes.len();
-                stack.push(ElemRef::node(
-                    id,
-                    root,
-                    count.saturating_sub(1),
-                    count,
-                ));
+                stack.push(ElemRef::node(id, root, count.saturating_sub(1), count));
             }
             PageNode::Disk(pgid) => {
                 let count = self.with_page(pgid, |page| PageHeader::read(page).count as usize)?;
@@ -845,15 +842,11 @@ impl TxInner {
             match self.page_node(bid, pgid)? {
                 PageNode::Node(id) => {
                     let count = self.buckets[&bid].nodes[&id].inodes.len();
-                    stack.push(ElemRef::node(
-                        id,
-                        pgid,
-                        count.saturating_sub(1),
-                        count,
-                    ));
+                    stack.push(ElemRef::node(id, pgid, count.saturating_sub(1), count));
                 }
                 PageNode::Disk(pgid) => {
-                    let count = self.with_page(pgid, |page| PageHeader::read(page).count as usize)?;
+                    let count =
+                        self.with_page(pgid, |page| PageHeader::read(page).count as usize)?;
                     let mut er = ElemRef::disk(pgid, count.saturating_sub(1));
                     er.count = count as i32;
                     stack.push(er);
@@ -986,7 +979,18 @@ impl TxInner {
         if k.as_deref() != Some(name) || flags & BUCKET_LEAF_FLAG == 0 {
             return Ok(None);
         }
-        let value = v.unwrap();
+        let value = v.ok_or_else(|| Error::Corrupt("missing bucket value".into()))?;
+        if value.len() < BUCKET_HEADER_SIZE {
+            return Err(Error::Corrupt("truncated bucket header".into()));
+        }
+        if InBucket::read(&value).root == 0 {
+            let inline = &value[BUCKET_HEADER_SIZE..];
+            if inline.len() < PAGE_HEADER_SIZE || !PageHeader::read(inline).is_leaf() {
+                return Err(Error::Corrupt("invalid inline bucket page".into()));
+            }
+            // Validate even empty/missing-key reads on a corrupt inline page.
+            read_inodes(inline)?;
+        }
         let child = self.open_bucket(&value);
         self.buckets
             .get_mut(&parent)
@@ -1140,12 +1144,12 @@ impl TxInner {
                     let children = if hdr.is_branch() {
                         (0..hdr.count as usize)
                             .map(|i| branch_pgid(page, i))
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>>>()?
                     } else {
                         Vec::new()
                     };
-                    (hdr.id, hdr.overflow, hdr.is_branch(), children)
-                })?;
+                    Ok((hdr.id, hdr.overflow, hdr.is_branch(), children))
+                })??;
                 if id > 1 {
                     out.push((id, overflow));
                 }
@@ -1174,14 +1178,13 @@ impl TxInner {
         // Fast path: sequential appends stay on the same leaf (bulk loads).
         if let Some((hbid, nid)) = self.put_hint {
             if hbid == bid {
-                let can_append = self.buckets.get(&bid).and_then(|b| b.nodes.get(&nid)).is_some_and(
-                    |n| {
-                        n.is_leaf
-                            && n.inodes
-                                .back()
-                                .is_none_or(|last| last.key.as_slice() < key)
-                    },
-                );
+                let can_append = self
+                    .buckets
+                    .get(&bid)
+                    .and_then(|b| b.nodes.get(&nid))
+                    .is_some_and(|n| {
+                        n.is_leaf && n.inodes.back().is_none_or(|last| last.key.as_slice() < key)
+                    });
                 if can_append {
                     // Ensure we are not colliding with a nested bucket at `key`
                     // (impossible on a pure append past last key, but keep the check cheap).
@@ -1229,20 +1232,20 @@ impl TxInner {
             }
             if self.buckets[&bid].header.root == 0 {
                 let page = self.buckets[&bid].inline_page.as_ref().unwrap();
-                let (flags, k, v) = leaf_at(page, r.index);
+                let (flags, k, v) = leaf_at(page, r.index)?;
                 if flags & BUCKET_LEAF_FLAG != 0 || k != key {
                     return Ok(None);
                 }
                 return Ok(Some(v.to_vec()));
             }
             self.with_page(r.pgid, |page| {
-                let (flags, k, v) = leaf_at(page, r.index);
+                let (flags, k, v) = leaf_at(page, r.index)?;
                 if flags & BUCKET_LEAF_FLAG != 0 || k != key {
-                    None
+                    Ok(None)
                 } else {
-                    Some(v.to_vec())
+                    Ok(Some(v.to_vec()))
                 }
-            })
+            })?
         })();
         self.get_stack = stack;
         result
@@ -1250,9 +1253,7 @@ impl TxInner {
 
     /// Like Go `Bucket.Get(key) != nil` without allocating value bytes.
     pub fn has_value(&self, bid: BucketId, key: &[u8]) -> Result<bool> {
-        if self.closed {
-            return Err(Error::TxClosed);
-        }
+        self.check_open()?;
         let b = self.buckets.get(&bid).ok_or(Error::TxClosed)?;
         let mut pgid = b.header.root;
         if pgid == 0 {
@@ -1260,7 +1261,7 @@ impl TxInner {
                 .inline_page
                 .as_ref()
                 .ok_or_else(|| Error::Corrupt("inline missing".into()))?;
-            return Ok(leaf_has_value(page, key));
+            return leaf_has_value(page, key);
         }
         loop {
             if !b.nodes_by_pgid.is_empty() {
@@ -1291,18 +1292,18 @@ impl TxInner {
                 if let Some(p) = self.dirty.get(&pgid) {
                     let hdr = PageHeader::read(p);
                     if hdr.is_leaf() {
-                        return Ok(leaf_has_value(p, key));
+                        return leaf_has_value(p, key);
                     }
-                    pgid = search_page_index_pgid(p, key);
+                    pgid = search_page_index_pgid(p, key)?;
                     continue;
                 }
             }
             let page = DbInner::page_bytes(&self.mmap_pin, self.db.page_size, pgid)?;
             let hdr = PageHeader::read(page);
             if hdr.is_leaf() {
-                return Ok(leaf_has_value(page, key));
+                return leaf_has_value(page, key);
             }
-            pgid = search_page_index_pgid(page, key);
+            pgid = search_page_index_pgid(page, key)?;
         }
     }
 
@@ -1312,25 +1313,29 @@ impl TxInner {
         // Fast path: sequential deletes often stay on the same leaf.
         if let Some((hbid, nid)) = self.delete_hint {
             if hbid == bid {
-                let hit = self.buckets.get(&bid).and_then(|b| b.nodes.get(&nid)).and_then(|n| {
-                    if !n.is_leaf || n.inodes.is_empty() {
-                        return None;
-                    }
-                    if n.inodes.front().map(|i| i.key.as_slice()) == Some(key) {
-                        return Some((0usize, n.inodes[0].flags));
-                    }
-                    let first = n.inodes.front()?.key.as_slice();
-                    let last = n.inodes.back()?.key.as_slice();
-                    if key < first || key > last {
-                        return None;
-                    }
-                    let index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
-                    if index < n.inodes.len() && n.inodes[index].key.as_slice() == key {
-                        Some((index, n.inodes[index].flags))
-                    } else {
-                        None
-                    }
-                });
+                let hit = self
+                    .buckets
+                    .get(&bid)
+                    .and_then(|b| b.nodes.get(&nid))
+                    .and_then(|n| {
+                        if !n.is_leaf || n.inodes.is_empty() {
+                            return None;
+                        }
+                        if n.inodes.front().map(|i| i.key.as_slice()) == Some(key) {
+                            return Some((0usize, n.inodes[0].flags));
+                        }
+                        let first = n.inodes.front()?.key.as_slice();
+                        let last = n.inodes.back()?.key.as_slice();
+                        if key < first || key > last {
+                            return None;
+                        }
+                        let index = n.inodes.partition_point(|ino| ino.key.as_slice() < key);
+                        if index < n.inodes.len() && n.inodes[index].key.as_slice() == key {
+                            Some((index, n.inodes[index].flags))
+                        } else {
+                            None
+                        }
+                    });
                 if let Some((index, flags)) = hit {
                     if flags & BUCKET_LEAF_FLAG != 0 {
                         return Err(Error::IncompatibleValue);
@@ -1370,13 +1375,13 @@ impl TxInner {
                 )
             } else if self.buckets[&bid].header.root == 0 {
                 let page = self.buckets[&bid].inline_page.as_ref().unwrap();
-                let (flags, k, _) = leaf_at(page, index);
+                let (flags, k, _) = leaf_at(page, index)?;
                 (k == key, flags & BUCKET_LEAF_FLAG != 0)
             } else {
                 self.with_page(r.pgid, |page| {
-                    let (flags, k, _) = leaf_at(page, index);
-                    (k == key, flags & BUCKET_LEAF_FLAG != 0)
-                })?
+                    let (flags, k, _) = leaf_at(page, index)?;
+                    Ok((k == key, flags & BUCKET_LEAF_FLAG != 0))
+                })??
             };
             if !matches {
                 return Ok(());
@@ -2004,19 +2009,61 @@ impl TxInner {
             return Err(Error::ManagedTx);
         }
         self.check_writable()?;
+        let prepared = self.prepare_commit();
+        if let Err(e) = prepared {
+            self.rollback_internal();
+            return Err(e);
+        }
+        if let Err(e) = self.write_pages() {
+            self.db
+                .recovery_required
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.rollback_internal();
+            return Err(e);
+        }
+        if let Err(e) = self.write_meta() {
+            self.db
+                .recovery_required
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.rollback_internal();
+            return Err(Error::CommitUncertain(Box::new(e)));
+        }
+        // Meta commit completed (sync may be disabled): never roll it back on remap failure.
+        let mapping = {
+            let _g = self.db.metalock.lock();
+            *self.db.committed_meta.lock() = self.meta.clone();
+            let result = self
+                .db
+                .file_size()
+                .and_then(|n| self.db.ensure_mapped(n as usize));
+            if result.is_err() {
+                self.db
+                    .recovery_required
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            result
+        };
+        let handlers = std::mem::take(&mut self.commit_handlers);
+        self.close_internal();
+        for h in handlers {
+            h();
+        }
+        mapping.map_err(|e| Error::CommittedMappingFailed(Box::new(e)))
+    }
+
+    fn prepare_commit(&mut self) -> Result<()> {
         self.rebalance_bucket(self.root)?;
         let opgid = self.meta.pgid;
         self.spill_bucket(self.root)?;
         self.meta.root = self.buckets[&self.root].header;
 
         if self.meta.freelist != PGID_NO_FREELIST {
-            if let Ok(page) = self.db.read_page(self.meta.freelist) {
-                let hdr = PageHeader::read(&page);
-                self.db
-                    .freelist
-                    .lock()
-                    .free(self.meta.txid, self.meta.freelist, hdr.overflow);
-            }
+            let page = self.db.read_page(self.meta.freelist)?;
+            let hdr = PageHeader::read(&page);
+            self.db
+                .freelist
+                .lock()
+                .free(self.meta.txid, self.meta.freelist, hdr.overflow);
         }
         if !self.db.no_freelist_sync {
             self.commit_freelist()?;
@@ -2029,16 +2076,6 @@ impl TxInner {
             self.db.grow(sz)?;
         }
 
-        self.write_pages()?;
-        self.write_meta()?;
-        let file_len = self.db.file_size()? as usize;
-        let _ = self.db.ensure_mapped(file_len);
-        *self.db.committed_meta.lock() = self.meta.clone();
-        let handlers = std::mem::take(&mut self.commit_handlers);
-        self.close_internal();
-        for h in handlers {
-            h();
-        }
         Ok(())
     }
 
@@ -2057,10 +2094,18 @@ impl TxInner {
         let mut pages: Vec<(Pgid, Vec<u8>)> = self.dirty.drain().collect();
         pages.sort_by_key(|(id, _)| *id);
         for (id, buf) in &pages {
+            #[cfg(test)]
+            self.db.inject(
+                crate::recovery_tests::Stage::DataWrite,
+                Some((buf, *id * self.db.page_size as u64)),
+            )?;
             let off = *id * self.db.page_size as u64;
             self.db.write_at(buf, off)?;
         }
         if !self.db.no_sync {
+            #[cfg(test)]
+            self.db
+                .inject(crate::recovery_tests::Stage::DataSync, None)?;
             self.db.fdatasync()?;
         }
         Ok(())
@@ -2071,9 +2116,17 @@ impl TxInner {
         write_meta_page(&mut buf, &self.meta);
         let id = self.meta.txid % 2;
         let _g = self.db.metalock.lock();
+        #[cfg(test)]
+        self.db.inject(
+            crate::recovery_tests::Stage::MetaWrite,
+            Some((&buf, id * self.db.page_size as u64)),
+        )?;
         self.db.write_at(&buf, id * self.db.page_size as u64)?;
         drop(_g);
         if !self.db.no_sync {
+            #[cfg(test)]
+            self.db
+                .inject(crate::recovery_tests::Stage::MetaSync, None)?;
             self.db.fdatasync()?;
         }
         Ok(())
@@ -2096,19 +2149,16 @@ impl TxInner {
         }
         if self.writable {
             self.db.freelist.lock().rollback(self.meta.txid);
-        }
-        self.close_internal();
-    }
-
-    /// Error-path rollback that also reloads freelist from disk / scan (Go `tx.rollback`).
-    #[allow(dead_code)]
-    pub fn rollback_and_reload(&mut self) {
-        if self.closed {
-            return;
-        }
-        if self.writable {
-            self.db.freelist.lock().rollback(self.meta.txid);
-            let _ = self.db.reload_freelist_after_rollback();
+            if !self
+                .db
+                .recovery_required
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && self.db.reload_freelist_after_rollback().is_err()
+            {
+                self.db
+                    .recovery_required
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         self.close_internal();
     }
@@ -2133,7 +2183,11 @@ impl TxInner {
             self.db
                 .open_ro_tx
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            if self.db.freelist_loaded.load(std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .db
+                .freelist_loaded
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 self.db.freelist.lock().remove_readonly_txid(self.meta.txid);
             }
         }
@@ -2187,29 +2241,29 @@ impl TxInner {
 }
 
 /// Binary-search a branch page; sets stack index; returns child pgid.
-fn search_page_index(stack: &mut [ElemRef], page: &[u8], key: &[u8]) -> Pgid {
-    let (index, pgid) = branch_search(page, key);
+fn search_page_index(stack: &mut [ElemRef], page: &[u8], key: &[u8]) -> Result<Pgid> {
+    let (index, pgid) = branch_search(page, key)?;
     stack.last_mut().unwrap().index = index;
-    pgid
+    Ok(pgid)
 }
 
-fn search_page_index_pgid(page: &[u8], key: &[u8]) -> Pgid {
-    branch_search(page, key).1
+fn search_page_index_pgid(page: &[u8], key: &[u8]) -> Result<Pgid> {
+    Ok(branch_search(page, key)?.1)
 }
 
 #[inline(always)]
-fn branch_search(page: &[u8], key: &[u8]) -> (usize, Pgid) {
+fn branch_search(page: &[u8], key: &[u8]) -> Result<(usize, Pgid)> {
     let hdr = PageHeader::read(page);
     let count = hdr.count as usize;
     if count == 0 {
-        return (0, 0);
+        return Err(Error::Corrupt("empty branch page".into()));
     }
     let mut exact = false;
     let mut lo = 0;
     let mut hi = count;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let (_, k) = branch_at(page, mid);
+        let (_, k) = branch_at(page, mid)?;
         match k.cmp(key) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
@@ -2227,16 +2281,16 @@ fn branch_search(page: &[u8], key: &[u8]) -> (usize, Pgid) {
     if index >= count {
         index = count - 1;
     }
-    (index, branch_pgid(page, index))
+    Ok((index, branch_pgid(page, index)?))
 }
 
-fn nsearch_page(stack: &mut [ElemRef], page: &[u8], key: &[u8]) {
+fn nsearch_page(stack: &mut [ElemRef], page: &[u8], key: &[u8]) -> Result<()> {
     let count = PageHeader::read(page).count as usize;
     let mut lo = 0;
     let mut hi = count;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let (_, k, _) = leaf_at(page, mid);
+        let (_, k, _) = leaf_at(page, mid)?;
         if k < key {
             lo = mid + 1;
         } else {
@@ -2244,16 +2298,17 @@ fn nsearch_page(stack: &mut [ElemRef], page: &[u8], key: &[u8]) {
         }
     }
     stack.last_mut().unwrap().index = lo;
+    Ok(())
 }
 
 #[inline(always)]
-fn leaf_has_value(page: &[u8], key: &[u8]) -> bool {
+fn leaf_has_value(page: &[u8], key: &[u8]) -> Result<bool> {
     let count = PageHeader::read(page).count as usize;
     let mut lo = 0;
     let mut hi = count;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let (_, k, _) = leaf_at(page, mid);
+        let (_, k, _) = leaf_at(page, mid)?;
         if k < key {
             lo = mid + 1;
         } else {
@@ -2261,10 +2316,10 @@ fn leaf_has_value(page: &[u8], key: &[u8]) -> bool {
         }
     }
     if lo >= count {
-        return false;
+        return Ok(false);
     }
-    let (flags, k, _) = leaf_at(page, lo);
-    flags & BUCKET_LEAF_FLAG == 0 && k == key
+    let (flags, k, _) = leaf_at(page, lo)?;
+    Ok(flags & BUCKET_LEAF_FLAG == 0 && k == key)
 }
 
 impl Drop for TxInner {

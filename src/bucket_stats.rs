@@ -61,7 +61,7 @@ fn walk_page(
             s.leaf_overflow_n += hdr.overflow as usize;
         }
         for i in 0..hdr.count as usize {
-            let (flags, _k, v) = leaf_at(page, i);
+            let (flags, _k, v) = leaf_at(page, i).expect("corrupt leaf page");
             if flags & BUCKET_LEAF_FLAG != 0 {
                 sub.add(&stats_from_bucket_value(tx, v));
             }
@@ -71,7 +71,7 @@ fn walk_page(
         s.branch_inuse += branch_inuse(page);
         s.branch_overflow_n += hdr.overflow as usize;
         for i in 0..hdr.count as usize {
-            let (child, _) = branch_at(page, i);
+            let (child, _) = branch_at(page, i).expect("corrupt branch page");
             walk_tree(tx, child, depth + 1, s, sub);
         }
     }

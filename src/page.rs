@@ -280,68 +280,71 @@ pub fn set_page_overflow(buf: &mut [u8], overflow: u32) {
     write_u32(buf, 12, overflow);
 }
 
-/// Leaf element at `index`, returning (flags, key, value).
-#[inline(always)]
-pub fn leaf_at(page: &[u8], index: usize) -> (u32, &[u8], &[u8]) {
-    let off = PAGE_HEADER_SIZE + index * LEAF_PAGE_ELEMENT_SIZE;
-    debug_assert!(off + LEAF_PAGE_ELEMENT_SIZE <= page.len());
-    // SAFETY: callers only pass indices < page.count; element header is 16 bytes.
-    unsafe {
-        let base = page.as_ptr().add(off);
-        let flags = u32::from_le_bytes([*base, *base.add(1), *base.add(2), *base.add(3)]);
-        let pos = u32::from_le_bytes([*base.add(4), *base.add(5), *base.add(6), *base.add(7)]) as usize;
-        let ksize =
-            u32::from_le_bytes([*base.add(8), *base.add(9), *base.add(10), *base.add(11)]) as usize;
-        let vsize =
-            u32::from_le_bytes([*base.add(12), *base.add(13), *base.add(14), *base.add(15)]) as usize;
-        let key_ptr = base.add(pos);
-        let key = std::slice::from_raw_parts(key_ptr, ksize);
-        let val = std::slice::from_raw_parts(key_ptr.add(ksize), vsize);
-        (flags, key, val)
-    }
+fn corrupt_element() -> Error {
+    Error::Corrupt("invalid page element range".into())
 }
 
-/// Branch element at `index`, returning (pgid, key).
-#[inline(always)]
-pub fn branch_at(page: &[u8], index: usize) -> (Pgid, &[u8]) {
-    let off = PAGE_HEADER_SIZE + index * BRANCH_PAGE_ELEMENT_SIZE;
-    debug_assert!(off + BRANCH_PAGE_ELEMENT_SIZE <= page.len());
-    unsafe {
-        let base = page.as_ptr().add(off);
-        let pos = u32::from_le_bytes([*base, *base.add(1), *base.add(2), *base.add(3)]) as usize;
-        let ksize =
-            u32::from_le_bytes([*base.add(4), *base.add(5), *base.add(6), *base.add(7)]) as usize;
-        let pgid = u64::from_le_bytes([
-            *base.add(8),
-            *base.add(9),
-            *base.add(10),
-            *base.add(11),
-            *base.add(12),
-            *base.add(13),
-            *base.add(14),
-            *base.add(15),
-        ]);
-        let key = std::slice::from_raw_parts(base.add(pos), ksize);
-        (pgid, key)
+fn element_header(page: &[u8], index: usize, flags: u16) -> Result<(usize, usize)> {
+    if page.len() < PAGE_HEADER_SIZE {
+        return Err(corrupt_element());
     }
+    let hdr = PageHeader::read(page);
+    if hdr.flags != flags || index >= usize::from(hdr.count) {
+        return Err(corrupt_element());
+    }
+    let element_size = hdr.element_size();
+    let table_end = usize::from(hdr.count)
+        .checked_mul(element_size)
+        .and_then(|n| n.checked_add(PAGE_HEADER_SIZE))
+        .ok_or_else(corrupt_element)?;
+    if table_end > page.len() {
+        return Err(corrupt_element());
+    }
+    let off = index
+        .checked_mul(element_size)
+        .and_then(|n| n.checked_add(PAGE_HEADER_SIZE))
+        .ok_or_else(corrupt_element)?;
+    Ok((off, table_end))
 }
 
-pub fn branch_pgid(page: &[u8], index: usize) -> Pgid {
-    let off = PAGE_HEADER_SIZE + index * BRANCH_PAGE_ELEMENT_SIZE;
-    debug_assert!(off + BRANCH_PAGE_ELEMENT_SIZE <= page.len());
-    unsafe {
-        let base = page.as_ptr().add(off + 8);
-        u64::from_le_bytes([
-            *base,
-            *base.add(1),
-            *base.add(2),
-            *base.add(3),
-            *base.add(4),
-            *base.add(5),
-            *base.add(6),
-            *base.add(7),
-        ])
+fn element_range(
+    page: &[u8],
+    off: usize,
+    table_end: usize,
+    pos: u32,
+    len: usize,
+) -> Result<std::ops::Range<usize>> {
+    let start = off
+        .checked_add(usize::try_from(pos).map_err(|_| corrupt_element())?)
+        .ok_or_else(corrupt_element)?;
+    let end = start.checked_add(len).ok_or_else(corrupt_element)?;
+    if start < table_end || end > page.len() {
+        return Err(corrupt_element());
     }
+    Ok(start..end)
+}
+
+/// Decode a leaf element, validating its header and complete key/value range.
+pub fn leaf_at(page: &[u8], index: usize) -> Result<(u32, &[u8], &[u8])> {
+    let (off, table_end) = element_header(page, index, LEAF_PAGE_FLAG)?;
+    let ksize = usize::try_from(read_u32(page, off + 8)).map_err(|_| corrupt_element())?;
+    let vsize = usize::try_from(read_u32(page, off + 12)).map_err(|_| corrupt_element())?;
+    let len = ksize.checked_add(vsize).ok_or_else(corrupt_element)?;
+    let range = element_range(page, off, table_end, read_u32(page, off + 4), len)?;
+    let (key, value) = page[range].split_at(ksize);
+    Ok((read_u32(page, off), key, value))
+}
+
+/// Decode a branch element, validating its header and key range.
+pub fn branch_at(page: &[u8], index: usize) -> Result<(Pgid, &[u8])> {
+    let (off, table_end) = element_header(page, index, BRANCH_PAGE_FLAG)?;
+    let len = usize::try_from(read_u32(page, off + 4)).map_err(|_| corrupt_element())?;
+    let range = element_range(page, off, table_end, read_u32(page, off), len)?;
+    Ok((read_u64(page, off + 8), &page[range]))
+}
+
+pub fn branch_pgid(page: &[u8], index: usize) -> Result<Pgid> {
+    Ok(branch_at(page, index)?.0)
 }
 
 pub fn meta_from_page(page: &[u8]) -> Meta {
@@ -417,13 +420,22 @@ pub fn write_inodes(page: &mut [u8], is_leaf: bool, inodes: &[Inode]) {
     }
 }
 
-pub fn read_inodes(page: &[u8]) -> Vec<Inode> {
+pub fn read_inodes(page: &[u8]) -> Result<Vec<Inode>> {
+    if page.len() < PAGE_HEADER_SIZE {
+        return Err(corrupt_element());
+    }
     let hdr = PageHeader::read(page);
     let count = hdr.count as usize;
+    if !hdr.is_leaf() && !hdr.is_branch() {
+        return Err(corrupt_element());
+    }
+    if count > 0 {
+        element_header(page, count - 1, hdr.flags)?;
+    }
     let mut inodes = Vec::with_capacity(count);
     if hdr.is_leaf() {
         for i in 0..count {
-            let (flags, key, value) = leaf_at(page, i);
+            let (flags, key, value) = leaf_at(page, i)?;
             inodes.push(Inode {
                 flags,
                 pgid: 0,
@@ -433,7 +445,7 @@ pub fn read_inodes(page: &[u8]) -> Vec<Inode> {
         }
     } else {
         for i in 0..count {
-            let (pgid, key) = branch_at(page, i);
+            let (pgid, key) = branch_at(page, i)?;
             inodes.push(Inode {
                 flags: 0,
                 pgid,
@@ -442,7 +454,7 @@ pub fn read_inodes(page: &[u8]) -> Vec<Inode> {
             });
         }
     }
-    inodes
+    Ok(inodes)
 }
 
 /// Serialized size of `inodes` on a leaf or branch page.
@@ -659,11 +671,11 @@ mod tests {
         let hdr = PageHeader::read(&page);
         assert!(hdr.is_leaf());
         assert_eq!(hdr.count, 2);
-        let (flags, key, val) = leaf_at(&page, 0);
+        let (flags, key, val) = leaf_at(&page, 0).unwrap();
         assert_eq!(flags, 0);
         assert_eq!(key, b"alice");
         assert_eq!(val, b"data1");
-        let (flags, key, _) = leaf_at(&page, 1);
+        let (flags, key, _) = leaf_at(&page, 1).unwrap();
         assert_eq!(flags, BUCKET_LEAF_FLAG);
         assert_eq!(key, b"nested");
     }
@@ -722,5 +734,114 @@ mod tests {
         assert!(!dump.is_empty());
         // id is little-endian u64 at offset 0
         assert!(dump.starts_with("00 01 00 00 00 00 00 00"));
+    }
+}
+
+#[cfg(test)]
+mod decoder_safety_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_pages_and_huge_indices_are_errors() {
+        let mut page = vec![0; 64];
+        write_inodes(
+            &mut page,
+            true,
+            &[Inode {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                ..Inode::default()
+            }],
+        );
+        for len in 0..40 {
+            assert!(leaf_at(&page[..len], 0).is_err(), "len={len}");
+        }
+        for index in [1, usize::MAX / 16, usize::MAX / 16 + 1, usize::MAX] {
+            assert!(leaf_at(&page, index).is_err());
+            assert!(branch_at(&page, index).is_err());
+            assert!(branch_pgid(&page, index).is_err());
+        }
+        write_inodes(
+            &mut page,
+            false,
+            &[Inode {
+                key: b"key".to_vec(),
+                pgid: 5,
+                ..Inode::default()
+            }],
+        );
+        for len in 0..35 {
+            assert!(branch_at(&page[..len], 0).is_err());
+            assert!(branch_pgid(&page[..len], 0).is_err());
+        }
+        assert_eq!(branch_pgid(&page, 0).unwrap(), 5);
+    }
+
+    #[test]
+    fn invalid_offsets_lengths_and_tables_are_errors() {
+        assert!(element_range(&[], usize::MAX, 0, 1, 0).is_err());
+        assert!(element_range(&[], 0, 0, 1, usize::MAX).is_err());
+        for leaf in [true, false] {
+            let mut original = vec![0; 64];
+            write_inodes(
+                &mut original,
+                leaf,
+                &[Inode {
+                    key: b"k".to_vec(),
+                    value: if leaf { b"v".to_vec() } else { vec![] },
+                    pgid: 5,
+                    ..Inode::default()
+                }],
+            );
+            let offsets: &[usize] = if leaf { &[4, 8, 12] } else { &[0, 4] };
+            for &offset in offsets {
+                for value in [u32::MAX, u32::MAX - 15, 64] {
+                    let mut page = original.clone();
+                    write_u32(&mut page, PAGE_HEADER_SIZE + offset, value);
+                    if leaf {
+                        assert!(leaf_at(&page, 0).is_err());
+                    } else {
+                        assert!(branch_at(&page, 0).is_err());
+                        assert!(branch_pgid(&page, 0).is_err());
+                    }
+                    assert!(read_inodes(&page).is_err());
+                }
+            }
+            let mut page = original.clone();
+            write_u32(&mut page, PAGE_HEADER_SIZE + if leaf { 4 } else { 0 }, 0);
+            assert!(read_inodes(&page).is_err(), "payload overlaps headers");
+            set_page_count(&mut original, u16::MAX);
+            assert!(read_inodes(&original).is_err());
+        }
+    }
+
+    // Deterministic fuzz corpus, also executed by Miri: every truncation and random
+    // header/payload, including valid type/count to reach range validation.
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        let mut state = 0x123456789abcdef0u64;
+        for len in 0..256 {
+            let mut page = vec![0; len];
+            for _ in 0..8 {
+                for byte in &mut page {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *byte = state as u8;
+                }
+                for flags in [LEAF_PAGE_FLAG, BRANCH_PAGE_FLAG] {
+                    if len >= PAGE_HEADER_SIZE {
+                        set_page_flags(&mut page, flags);
+                        set_page_count(&mut page, 1);
+                    }
+                    for index in [0, 1, usize::MAX] {
+                        let _ = leaf_at(&page, index);
+                        let _ = branch_at(&page, index);
+                        let _ = branch_pgid(&page, index);
+                    }
+                    let _ = read_inodes(&page);
+                }
+            }
+        }
     }
 }

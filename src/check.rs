@@ -101,12 +101,12 @@ fn recursively_check_bucket_in_page(
     let hdr = PageHeader::read(&page);
     if hdr.is_branch() {
         for i in 0..hdr.count as usize {
-            let (child, _) = branch_at(&page, i);
+            let (child, _) = branch_at(&page, i)?;
             recursively_check_bucket_in_page(tx, child, reachable, freed, errs)?;
         }
     } else if hdr.is_leaf() {
         for i in 0..hdr.count as usize {
-            let (flags, _k, v) = leaf_at(&page, i);
+            let (flags, _k, v) = leaf_at(&page, i)?;
             if flags & BUCKET_LEAF_FLAG != 0 && v.len() >= 16 {
                 let ib = InBucket::read(v);
                 if ib.root != 0 {
@@ -154,7 +154,7 @@ where
     let hdr = PageHeader::read(&page);
     if hdr.is_branch() {
         for i in 0..hdr.count as usize {
-            let (child, _) = branch_at(&page, i);
+            let (child, _) = branch_at(&page, i)?;
             stack.push(child);
             for_each_page_internal(tx, stack, fn_)?;
             stack.pop();
@@ -211,9 +211,9 @@ fn check_key_order(
         let mut running_min = min_closed.map(|s| s.to_vec());
         let mut max_in_subtree: Option<Vec<u8>> = None;
         for i in 0..hdr.count as usize {
-            let (child, key) = branch_at(&page, i);
+            let (child, key) = branch_at(&page, i)?;
             let next_max = if i + 1 < hdr.count as usize {
-                Some(branch_at(&page, i + 1).1.to_vec())
+                Some(branch_at(&page, i + 1)?.1.to_vec())
             } else {
                 max_open.map(|s| s.to_vec())
             };
@@ -237,7 +237,7 @@ fn check_key_order(
         let mut prev: Option<Vec<u8>> = None;
         let mut last: Option<Vec<u8>> = None;
         for i in 0..hdr.count as usize {
-            let (_f, key, _v) = leaf_at(&page, i);
+            let (_f, key, _v) = leaf_at(&page, i)?;
             if let Some(m) = min_closed {
                 if key < m {
                     errs.push(Error::Corrupt(format!(

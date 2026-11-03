@@ -14,7 +14,7 @@ fn test_bucket_get_non_existent() {
     let (_dir, db) = must_create();
     db.update(|tx| {
         let b = tx.create_bucket(b"widgets")?;
-        assert!(b.get(b"foo").is_none());
+        assert!(b.get(b"foo").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -28,7 +28,7 @@ fn test_bucket_put() {
         let b = tx.create_bucket(b"widgets")?;
         b.put(b"foo", b"bar")?;
         assert_eq!(
-            tx.bucket(b"widgets").unwrap().get(b"foo").as_deref(),
+            tx.bucket(b"widgets").unwrap().unwrap().get(b"foo").unwrap().as_deref(),
             Some(&b"bar"[..])
         );
         Ok(())
@@ -45,7 +45,7 @@ fn test_bucket_put_repeat() {
         b.put(b"foo", b"bar")?;
         b.put(b"foo", b"baz")?;
         assert_eq!(
-            tx.bucket(b"widgets").unwrap().get(b"foo").as_deref(),
+            tx.bucket(b"widgets").unwrap().unwrap().get(b"foo").unwrap().as_deref(),
             Some(&b"baz"[..])
         );
         Ok(())
@@ -70,11 +70,11 @@ fn test_bucket_put_large() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 1..count {
             let key = vec![b'0'; i * factor];
             let want = vec![b'X'; (count - i) * factor];
-            assert_eq!(b.get(&key).as_deref(), Some(want.as_slice()));
+            assert_eq!(b.get(&key).unwrap().as_deref(), Some(want.as_slice()));
         }
         Ok(())
     })
@@ -87,7 +87,7 @@ fn test_bucket_put_incompatible_value() {
     let (_dir, db) = must_create();
     db.update(|tx| {
         let b0 = tx.create_bucket(b"widgets")?;
-        tx.bucket(b"widgets").unwrap().create_bucket(b"foo")?;
+        tx.bucket(b"widgets").unwrap().unwrap().create_bucket(b"foo")?;
         assert!(matches!(b0.put(b"foo", b"bar"), Err(Error::IncompatibleValue)));
         Ok(())
     })
@@ -104,7 +104,7 @@ fn test_bucket_put_read_only() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         assert!(matches!(b.put(b"foo", b"bar"), Err(Error::TxNotWritable)));
         Ok(())
     })
@@ -119,7 +119,7 @@ fn test_bucket_delete() {
         let b = tx.create_bucket(b"widgets")?;
         b.put(b"foo", b"bar")?;
         b.delete(b"foo")?;
-        assert!(b.get(b"foo").is_none());
+        assert!(b.get(b"foo").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -138,7 +138,7 @@ fn test_bucket_delete_large() {
     })
     .unwrap();
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 0..100 {
             b.delete(format!("{i}").as_bytes())?;
         }
@@ -146,9 +146,9 @@ fn test_bucket_delete_large() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 0..100 {
-            assert!(b.get(format!("{i}").as_bytes()).is_none());
+            assert!(b.get(format!("{i}").as_bytes()).unwrap().is_none());
         }
         Ok(())
     })
@@ -166,9 +166,9 @@ fn test_bucket_delete_non_existing() {
     })
     .unwrap();
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         b.delete(b"foo")?;
-        assert!(b.bucket(b"nested").is_some());
+        assert!(b.bucket(b"nested").unwrap().is_some());
         Ok(())
     })
     .unwrap();
@@ -187,12 +187,12 @@ fn test_bucket_nested() {
     .unwrap();
     common::must_check(&db);
     db.update(|tx| {
-        tx.bucket(b"widgets").unwrap().put(b"bar", b"xxxx")?;
+        tx.bucket(b"widgets").unwrap().unwrap().put(b"bar", b"xxxx")?;
         Ok(())
     })
     .unwrap();
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 0..1000 {
             b.put(format!("{i}").as_bytes(), format!("{i}").as_bytes())?;
         }
@@ -200,24 +200,24 @@ fn test_bucket_nested() {
     })
     .unwrap();
     db.update(|tx| {
-        tx.bucket(b"widgets")
+        tx.bucket(b"widgets").unwrap()
             .unwrap()
-            .bucket(b"foo")
+            .bucket(b"foo").unwrap()
             .unwrap()
             .put(b"baz", b"yyyy")?;
         Ok(())
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         assert_eq!(
-            b.bucket(b"foo").unwrap().get(b"baz").as_deref(),
+            b.bucket(b"foo").unwrap().unwrap().get(b"baz").unwrap().as_deref(),
             Some(&b"yyyy"[..])
         );
-        assert_eq!(b.get(b"bar").as_deref(), Some(&b"xxxx"[..]));
+        assert_eq!(b.get(b"bar").unwrap().as_deref(), Some(&b"xxxx"[..]));
         for i in 0..1000 {
             let s = format!("{i}");
-            assert_eq!(b.get(s.as_bytes()).as_deref(), Some(s.as_bytes()));
+            assert_eq!(b.get(s.as_bytes()).unwrap().as_deref(), Some(s.as_bytes()));
         }
         Ok(())
     })
@@ -251,7 +251,7 @@ fn test_bucket_delete_bucket_nested() {
     })
     .unwrap();
     db.view(|tx| {
-        assert!(tx.bucket(b"widgets").unwrap().bucket(b"foo").is_none());
+        assert!(tx.bucket(b"widgets").unwrap().unwrap().bucket(b"foo").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -303,7 +303,7 @@ fn test_bucket_next_sequence_persist() {
     }
     let db = common::reopen(&dir, None);
     db.view(|tx| {
-        assert_eq!(tx.bucket(b"s").unwrap().sequence(), 1);
+        assert_eq!(tx.bucket(b"s").unwrap().unwrap().sequence(), 1);
         Ok(())
     })
     .unwrap();
@@ -319,7 +319,7 @@ fn test_bucket_next_sequence_read_only() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"s").unwrap();
+        let b = tx.bucket(b"s").unwrap().unwrap();
         assert!(matches!(b.next_sequence(), Err(Error::TxNotWritable)));
         Ok(())
     })
@@ -339,7 +339,7 @@ fn test_bucket_for_each() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         let mut keys = Vec::new();
         b.for_each(|k, v| {
             keys.push(k.to_vec());
@@ -370,7 +370,7 @@ fn test_bucket_for_each_bucket() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         let mut names = Vec::new();
         b.for_each_bucket(|name| {
             names.push(name.to_vec());
@@ -395,7 +395,7 @@ fn test_bucket_for_each_short_circuit() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         let err = b.for_each(|k, _| {
             if k == b"a" {
                 return Err(Error::KeyRequired);
@@ -481,7 +481,7 @@ fn test_bucket_get_incompatible_value() {
     db.update(|tx| {
         let b = tx.create_bucket(b"widgets")?;
         b.create_bucket(b"foo")?;
-        assert!(b.get(b"foo").is_none());
+        assert!(b.get(b"foo").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -498,7 +498,7 @@ fn test_bucket_delete_read_only() {
     .unwrap();
     db.view(|tx| {
         assert!(matches!(
-            tx.bucket(b"widgets").unwrap().delete(b"foo"),
+            tx.bucket(b"widgets").unwrap().unwrap().delete(b"foo"),
             Err(Error::TxNotWritable)
         ));
         Ok(())
@@ -524,7 +524,7 @@ fn test_bucket_for_each_bucket_no_buckets() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         let mut names = Vec::new();
         b.for_each_bucket(|name| {
             names.push(name.to_vec());
@@ -543,7 +543,7 @@ fn test_bucket_bucket_incompatible_value() {
     db.update(|tx| {
         let widgets = tx.create_bucket(b"widgets")?;
         widgets.put(b"foo", b"bar")?;
-        assert!(widgets.bucket(b"foo").is_none());
+        assert!(widgets.bucket(b"foo").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -594,16 +594,16 @@ fn test_bucket_delete_bucket_nested2() {
     })
     .unwrap();
     db.update(|tx| {
-        let widgets = tx.bucket(b"widgets").unwrap();
-        let foo = widgets.bucket(b"foo").unwrap();
-        let bar = foo.bucket(b"bar").unwrap();
-        assert_eq!(bar.get(b"baz").as_deref(), Some(&b"bat"[..]));
+        let widgets = tx.bucket(b"widgets").unwrap().unwrap();
+        let foo = widgets.bucket(b"foo").unwrap().unwrap();
+        let bar = foo.bucket(b"bar").unwrap().unwrap();
+        assert_eq!(bar.get(b"baz").unwrap().as_deref(), Some(&b"bat"[..]));
         tx.delete_bucket(b"widgets")?;
         Ok(())
     })
     .unwrap();
     db.view(|tx| {
-        assert!(tx.bucket(b"widgets").is_none());
+        assert!(tx.bucket(b"widgets").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -623,15 +623,15 @@ fn test_bucket_put_single() {
     for key in &keys {
         let val = format!("val_{}", String::from_utf8_lossy(key)).into_bytes();
         db.update(|tx| {
-            tx.bucket(b"widgets").unwrap().put(key, &val)?;
+            tx.bucket(b"widgets").unwrap().unwrap().put(key, &val)?;
             Ok(())
         })
         .unwrap();
         expected.insert(key.clone(), val);
         db.view(|tx| {
-            let b = tx.bucket(b"widgets").unwrap();
+            let b = tx.bucket(b"widgets").unwrap().unwrap();
             for (k, v) in &expected {
-                assert_eq!(b.get(k).as_deref(), Some(v.as_slice()));
+                assert_eq!(b.get(k).unwrap().as_deref(), Some(v.as_slice()));
             }
             Ok(())
         })
@@ -652,7 +652,7 @@ fn test_bucket_put_multiple() {
         .map(|i| (format!("k{i:04}").into_bytes(), format!("v{i:04}").into_bytes()))
         .collect();
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for (k, v) in &items {
             b.put(k, v)?;
         }
@@ -660,9 +660,9 @@ fn test_bucket_put_multiple() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for (k, v) in &items {
-            assert_eq!(b.get(k).as_deref(), Some(v.as_slice()));
+            assert_eq!(b.get(k).unwrap().as_deref(), Some(v.as_slice()));
         }
         Ok(())
     })
@@ -680,7 +680,7 @@ fn test_bucket_delete_quick() {
     .unwrap();
     let items: Vec<Vec<u8>> = (0..80).map(|i| format!("del{i:03}").into_bytes()).collect();
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for k in &items {
             b.put(k, k)?;
         }
@@ -689,13 +689,13 @@ fn test_bucket_delete_quick() {
     .unwrap();
     for k in &items {
         db.update(|tx| {
-            tx.bucket(b"widgets").unwrap().delete(k)?;
+            tx.bucket(b"widgets").unwrap().unwrap().delete(k)?;
             Ok(())
         })
         .unwrap();
     }
     db.view(|tx| {
-        tx.bucket(b"widgets").unwrap().for_each(|_k, v| {
+        tx.bucket(b"widgets").unwrap().unwrap().for_each(|_k, v| {
             assert!(v.is_none());
             Ok(())
         })?;
@@ -715,7 +715,7 @@ fn test_bucket_stats_empty_bucket() {
     .unwrap();
     common::must_check(&db);
     db.view(|tx| {
-        let stats = tx.bucket(b"whozawhats").unwrap().stats();
+        let stats = tx.bucket(b"whozawhats").unwrap().unwrap().stats();
         assert_eq!(stats.branch_page_n, 0);
         assert_eq!(stats.leaf_page_n, 0);
         assert_eq!(stats.key_n, 0);
@@ -740,7 +740,7 @@ fn test_bucket_stats_small() {
     .unwrap();
     common::must_check(&db);
     db.view(|tx| {
-        let stats = tx.bucket(b"whozawhats").unwrap().stats();
+        let stats = tx.bucket(b"whozawhats").unwrap().unwrap().stats();
         assert_eq!(stats.key_n, 1);
         assert_eq!(stats.depth, 1);
         assert_eq!(stats.bucket_n, 1);
@@ -773,7 +773,7 @@ fn test_bucket_stats_nested() {
     .unwrap();
     common::must_check(&db);
     db.view(|tx| {
-        let stats = tx.bucket(b"foo").unwrap().stats();
+        let stats = tx.bucket(b"foo").unwrap().unwrap().stats();
         assert_eq!(stats.leaf_page_n, 2);
         assert_eq!(stats.key_n, 122);
         assert_eq!(stats.depth, 3);
@@ -802,7 +802,7 @@ fn test_bucket_stats() {
     }
     let long_key_length = 10 * db.info().page_size + 17;
     db.update(|tx| {
-        tx.bucket(b"woojits")
+        tx.bucket(b"woojits").unwrap()
             .unwrap()
             .put(big_key, &vec![b'*'; long_key_length])?;
         Ok(())
@@ -811,7 +811,7 @@ fn test_bucket_stats() {
     common::must_check(&db);
 
     db.view(|tx| {
-        let stats = tx.bucket(b"woojits").unwrap().stats();
+        let stats = tx.bucket(b"woojits").unwrap().unwrap().stats();
         let page_size = db.info().page_size;
         if page_size == 4096 {
             let leaf_inuse = 7 * 16
@@ -862,7 +862,7 @@ fn test_bucket_stats_random_fill_smoke() {
     })
     .unwrap();
     db.view(|tx| {
-        let stats = tx.bucket(b"data").unwrap().stats();
+        let stats = tx.bucket(b"data").unwrap().unwrap().stats();
         assert_eq!(stats.key_n, 200);
         assert!(stats.leaf_page_n >= 1);
         Ok(())
@@ -884,7 +884,7 @@ fn test_bucket_stats_large() {
     })
     .unwrap();
     db.view(|tx| {
-        let stats = tx.bucket(b"data").unwrap().stats();
+        let stats = tx.bucket(b"data").unwrap().unwrap().stats();
         assert_eq!(stats.key_n, 5000);
         Ok(())
     })
@@ -898,7 +898,7 @@ fn test_bucket_get_from_node() {
     db.update(|tx| {
         let b = tx.create_bucket(b"widgets")?;
         b.put(b"foo", b"bar")?;
-        assert_eq!(b.get(b"foo").as_deref(), Some(&b"bar"[..]));
+        assert_eq!(b.get(b"foo").unwrap().as_deref(), Some(&b"bar"[..]));
         Ok(())
     })
     .unwrap();
@@ -994,7 +994,7 @@ fn test_bucket_delete_freelist_overflow_moderate() {
         .unwrap();
     }
     db.update(|tx| {
-        let b = tx.bucket(b"0").unwrap();
+        let b = tx.bucket(b"0").unwrap().unwrap();
         let mut c = b.cursor();
         let mut kv = c.first().unwrap();
         while kv.0.is_some() {
@@ -1026,7 +1026,7 @@ fn test_bucket_delete_freelist_overflow() {
         .unwrap();
     }
     db.update(|tx| {
-        let b = tx.bucket(b"0").unwrap();
+        let b = tx.bucket(b"0").unwrap().unwrap();
         let mut c = b.cursor();
         let mut kv = c.first().unwrap();
         while kv.0.is_some() {
@@ -1060,7 +1060,7 @@ fn test_bucket_delete_closed() {
     })
     .unwrap();
     let tx = db.begin(true).unwrap();
-    let b = tx.bucket(b"widgets").unwrap();
+    let b = tx.bucket(b"widgets").unwrap().unwrap();
     tx.rollback().unwrap();
     common::assert_err(b.delete(b"foo"), Error::TxClosed);
 }
@@ -1086,7 +1086,7 @@ fn test_bucket_for_each_closed() {
     })
     .unwrap();
     let tx = db.begin(false).unwrap();
-    let b = tx.bucket(b"widgets").unwrap();
+    let b = tx.bucket(b"widgets").unwrap().unwrap();
     tx.rollback().unwrap();
     let err = b.for_each(|_, _| Ok(()));
     common::assert_err(err, Error::TxClosed);

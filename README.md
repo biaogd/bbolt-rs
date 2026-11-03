@@ -26,8 +26,8 @@ db.update(|tx| {
 })?;
 
 db.view(|tx| {
-    let users = tx.bucket(b"users").unwrap();
-    assert_eq!(users.get(b"alice").as_deref(), Some(&b"data"[..]));
+    let users = tx.bucket(b"users")?.unwrap();
+    assert_eq!(users.get(b"alice")?.as_deref(), Some(&b"data"[..]));
     Ok(())
 })?;
 ```
@@ -37,7 +37,7 @@ Managed transactions: `Ok` from `update` commits, `Err` rolls back. `Db` is `Clo
 ## CLI & tests
 
 ```sh
-cargo run --bin bbolt -- info path/to.db
+cargo run --features cli --bin bbolt -- info path/to.db
 cargo test
 cargo test --test cross_go_test   # Go↔Rust oracle (needs `go` + `python3`)
 ```
@@ -56,7 +56,7 @@ Same cloud VM, `n=100000`, key=8, value=32, page=4096, fsync on, fill 0.5, 1 war
 
 ```sh
 ./benches/run_compare.sh
-cargo run --release --bin bench_compare -- --dir /tmp/r --workload seq_put --n 100000
+cargo run --release --features cli --bin bench_compare -- --dir /tmp/r --workload seq_put --n 100000
 ```
 
 ## Compatibility
@@ -67,3 +67,40 @@ cargo run --release --bin bench_compare -- --dir /tmp/r --workload seq_put --n 1
 - Static fixtures in `tests/fixtures/`; live oracle needs `go` on `PATH` (one-time module fetch) and `python3`.
 - `MmapFlags` / `Mlock` accepted for API parity but not fully applied; per-op TxStats counters not incremented on every internal path yet.
 - Do not interchange files with [ambaxter/bbolt-rs](https://github.com/ambaxter/bbolt-rs) (Bolt v1.3.10). Full bench notes: **[BENCHMARKS.md](BENCHMARKS.md)**.
+
+Reading APIs return `Result<Option<T>>` (`get`, `bucket`) or `Result<bool>`
+(`has_value`). Use `?` to propagate failures; only `Ok(None)` / `Ok(false)` means
+missing data. This is a breaking change from the previous `Option` / `bool` API.
+Page element decoders and `read_inodes` also return `Result`.
+
+A commit I/O failure closes the transaction and prevents new transactions until
+`Db::close()` and reopen. Existing read snapshots remain valid. Data-page write
+or first-sync errors return their original I/O error. `CommitUncertain` means a
+meta write or its synchronization failed: after reopen, the complete old or new
+transaction may be present. Do not blindly retry external side effects.
+`CommittedMappingFailed` means the configured meta synchronization succeeded
+(or was disabled by `no_sync`), but mapping recovery failed: the transaction was
+committed, its commit handlers ran, and it must not be treated as rolled back.
+The previous mapping remains pinned. `BatchFailed` preserves the shared commit
+error as its source. With `no_sync`, successful commits do not promise power-loss
+durability.
+
+The library does not choose a global allocator. `cli` enables the CLI and compare
+harness; `jemalloc` optionally selects jemalloc in those executables only. Host
+applications remain responsible for their own allocator.
+
+Batch callbacks may execute repeatedly, including after another callback fails;
+external effects must tolerate retries. A single attempt runs callbacks in queue
+order; concurrent groups and failed-call retries have no global commit-order
+guarantee. `max_batch_delay = Duration::ZERO` drains ready calls synchronously,
+with no timer or forced delay. Nonzero delay uses at most one sleeping timer per
+database. Queued groups flush at `max_batch_size` (minimum one); active groups
+and waiting callers are bounded by application concurrency. Lowering the size
+while a group is queued flushes that existing group on the next enqueue.
+
+Decoder verification: `cargo test --release --lib decoder_safety_tests`,
+`cargo +nightly miri test --lib decoder_safety_tests`, and
+`cargo +nightly fuzz run page_decode -- -max_total_time=60` (requires cargo-fuzz).
+CI also runs Linux/macOS/Windows tests and builds x86_64 musl. Commit-stage exit
+tests terminate child processes without destructors; they verify process-crash
+recovery, not storage hardware behavior under power loss.

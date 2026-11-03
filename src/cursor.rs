@@ -10,10 +10,7 @@ use crate::bucket::Bucket;
 use crate::db::DbInner;
 use crate::error::{Error, Result};
 use crate::inner::{BucketId, ElemRef, TxInner};
-use crate::page::{
-    leaf_at, read_u32, PageHeader, BUCKET_LEAF_FLAG, LEAF_PAGE_ELEMENT_SIZE, PAGE_HEADER_SIZE,
-    Pgid,
-};
+use crate::page::{leaf_at, PageHeader, Pgid, BUCKET_LEAF_FLAG};
 
 /// Key and optional value. Nested buckets yield `None` for the value.
 pub type KeyValue = (Option<Vec<u8>>, Option<Vec<u8>>);
@@ -135,6 +132,7 @@ impl Cursor {
 
     /// Like Go `Cursor.Next` with key/value views (mmap offsets or owned buffers).
     pub fn next_view(&mut self) -> Result<bool> {
+        self.tx.borrow().check_open()?;
         if self.leaf_pgid != 0 && self.leaf_index + 1 < self.leaf_count {
             self.leaf_index += 1;
             if let Some(r) = self.stack.last_mut() {
@@ -186,7 +184,7 @@ impl Cursor {
         if !ph.is_branch() || next_index >= ph.count as usize {
             return Ok(false);
         }
-        let (child_pgid, _) = crate::page::branch_at(parent_page, next_index);
+        let (child_pgid, _) = crate::page::branch_at(parent_page, next_index)?;
         let child_page = match DbInner::page_bytes(&self.mmap, self.page_size, child_pgid) {
             Ok(p) => p,
             Err(_) => return Ok(false),
@@ -315,22 +313,14 @@ impl Cursor {
         self.leaf_index = r.index;
     }
 
-    /// Bind using the cached leaf page start (no page-header reparse).
+    /// Bind a view only after validating ranges within the complete leaf page.
     fn bind_mmap_leaf_cached(&mut self, index: usize) -> Result<()> {
-        let elem_off = self.leaf_page_start + PAGE_HEADER_SIZE + index * LEAF_PAGE_ELEMENT_SIZE;
-        let end = elem_off + LEAF_PAGE_ELEMENT_SIZE;
-        if end > self.mmap.len() {
-            return Err(Error::Corrupt("leaf element past mmap".into()));
-        }
-        let mmap = &self.mmap[..];
-        let flags = read_u32(mmap, elem_off);
-        let pos = read_u32(mmap, elem_off + 4) as usize;
-        let ksize = read_u32(mmap, elem_off + 8) as usize;
-        let vsize = read_u32(mmap, elem_off + 12) as usize;
-        let key_off = elem_off + pos;
-        if key_off + ksize + vsize > self.mmap.len() {
-            return Err(Error::Corrupt("leaf kv past mmap".into()));
-        }
+        self.view_valid = false;
+        let page = DbInner::page_bytes(&self.mmap, self.page_size, self.leaf_pgid)?;
+        let (flags, key, value) = leaf_at(page, index)?;
+        let key_off = key.as_ptr() as usize - self.mmap.as_ptr() as usize;
+        let ksize = key.len();
+        let vsize = value.len();
         self.mmap_view = true;
         self.key_off = key_off;
         self.key_len = ksize;
@@ -348,6 +338,7 @@ impl Cursor {
 
     /// Bind view to a leaf element using integer offsets into the pinned mmap.
     fn bind_mmap_leaf(&mut self, pgid: Pgid, index: usize) -> Result<()> {
+        self.leaf_pgid = pgid;
         self.leaf_page_start = pgid as usize * self.page_size;
         // Validate page exists / is a leaf once.
         let page = DbInner::page_bytes(&self.mmap, self.page_size, pgid)?;
@@ -409,7 +400,7 @@ impl Cursor {
                     .inline_page
                     .as_ref()
                     .ok_or_else(|| Error::Corrupt("inline missing".into()))?;
-                let (flags, key, val) = leaf_at(page, r.index);
+                let (flags, key, val) = leaf_at(page, r.index)?;
                 Some((flags, key.to_vec(), val.to_vec()))
             }
         };

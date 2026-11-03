@@ -3,7 +3,6 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use std::sync::atomic::Ordering;
 
@@ -40,32 +39,32 @@ where
     }
 
     let (tx_ch, rx) = mpsc::channel();
-    let run_now;
+    let ready;
     {
         let mut st = db.inner.batch.lock();
         st.calls.push(Call {
             f: Box::new(f),
             ret: tx_ch,
         });
-        run_now = st.calls.len() >= db.inner.max_batch_size.load(Ordering::Relaxed);
-        if run_now {
-            st.scheduled = false;
-        } else if !st.scheduled {
+        let delay = *db.inner.max_batch_delay.lock();
+        let run_now = delay.is_zero()
+            || st.calls.len() >= db.inner.max_batch_size.load(Ordering::Relaxed).max(1);
+        ready = if run_now {
+            std::mem::take(&mut st.calls)
+        } else {
+            Vec::new()
+        };
+        if !run_now && !st.scheduled {
+            // At most one sleeping timer per database, including size-triggered drains.
             st.scheduled = true;
             let db2 = db.clone();
-            let delay = {
-                let d = *db.inner.max_batch_delay.lock();
-                d.max(Duration::from_millis(1))
-            };
             thread::spawn(move || {
                 thread::sleep(delay);
                 drain_and_run(&db2);
             });
         }
     }
-    if run_now {
-        drain_and_run(db);
-    }
+    run_calls(db, ready);
     rx.recv().unwrap_or(Err(Error::TxClosed))
 }
 
@@ -91,17 +90,113 @@ fn run_calls(db: &Db, mut calls: Vec<Call>) {
             Ok(())
         });
         if let Some(i) = fail_idx {
-            let c = calls.swap_remove(i);
-            let solo = db.update(|tx| (c.f)(tx));
+            let c = calls.remove(i);
+            let solo = db.update(|tx| safely_call(&c.f, tx));
             let _ = c.ret.send(solo);
             continue;
         }
+        let result = result.map_err(std::sync::Arc::new);
         for c in calls.drain(..) {
             let msg = match &result {
                 Ok(()) => Ok(()),
-                Err(e) => Err(Error::Corrupt(e.to_string())),
+                Err(e) => Err(Error::BatchFailed(std::sync::Arc::clone(e))),
             };
             let _ = c.ret.send(msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Options;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    fn zero_delay_never_schedules_a_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("db"), 0o600, Some(Options::default())).unwrap();
+        db.set_max_batch_delay(Duration::ZERO);
+        db.batch(|tx| tx.create_bucket(b"zero")?.put(b"a", b"b"))
+            .unwrap();
+        let state = db.inner.batch.lock();
+        assert!(!state.scheduled);
+        assert!(state.calls.is_empty());
+        drop(state);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn callback_failure_retries_survivors_and_preserves_queue_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("db"), 0o600, None).unwrap();
+        db.update(|tx| tx.create_bucket(b"batch").map(|_| ()))
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let (a, ra) = mpsc::channel();
+        let (b, rb) = mpsc::channel();
+        let (c, rc) = mpsc::channel();
+        let counter = count.clone();
+        let calls = vec![
+            Call {
+                f: Box::new(move |tx| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tx.bucket(b"batch")?.unwrap().put(b"key", b"first")
+                }),
+                ret: a,
+            },
+            Call {
+                f: Box::new(|_| Err(Error::KeyRequired)),
+                ret: b,
+            },
+            Call {
+                f: Box::new(|tx| tx.bucket(b"batch")?.unwrap().put(b"key", b"last")),
+                ret: c,
+            },
+        ];
+        run_calls(&db, calls);
+        ra.recv().unwrap().unwrap();
+        assert!(matches!(rb.recv().unwrap(), Err(Error::KeyRequired)));
+        rc.recv().unwrap().unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        db.view(|tx| {
+            assert_eq!(tx.bucket(b"batch")?.unwrap().get(b"key")?.unwrap(), b"last");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn zero_delay_concurrent_calls_all_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("db"), 0o600, None).unwrap();
+        db.update(|tx| tx.create_bucket(b"batch").map(|_| ()))
+            .unwrap();
+        db.set_max_batch_delay(Duration::ZERO);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut threads = vec![];
+        for i in 0u64..8 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                db.batch(move |tx| tx.bucket(b"batch")?.unwrap().put(&i.to_le_bytes(), b"ok"))
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        db.view(|tx| {
+            let b = tx.bucket(b"batch")?.unwrap();
+            for i in 0u64..8 {
+                assert!(b.has_value(&i.to_le_bytes())?);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(!db.inner.batch.lock().scheduled);
+        db.close().unwrap();
     }
 }

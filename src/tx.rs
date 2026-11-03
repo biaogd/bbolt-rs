@@ -49,13 +49,12 @@ impl Tx {
         Cursor::new(Rc::clone(&self.inner), 0)
     }
 
-    pub fn bucket(&self, name: &[u8]) -> Option<Bucket> {
+    /// Open a top-level bucket, distinguishing missing names from read failures.
+    pub fn bucket(&self, name: &[u8]) -> Result<Option<Bucket>> {
         let mut inner = self.inner.borrow_mut();
-        inner
-            .bucket_by_name(0, name)
-            .ok()
-            .flatten()
-            .map(|id| Bucket::new(Rc::clone(&self.inner), id))
+        Ok(inner
+            .bucket_by_name(0, name)?
+            .map(|id| Bucket::new(Rc::clone(&self.inner), id)))
     }
 
     pub fn create_bucket(&self, name: &[u8]) -> Result<Bucket> {
@@ -98,13 +97,19 @@ impl Tx {
         let mut c = self.cursor();
         let mut kv = c.first()?;
         while let Some(k) = kv.0.clone() {
-            let b = self.bucket(&k).ok_or(Error::BucketNotFound)?;
+            let b = self.bucket(&k)?.ok_or(Error::BucketNotFound)?;
             f(&k, &b)?;
             kv = c.next()?;
         }
         Ok(())
     }
 
+    /// Commit and close this write transaction.
+    ///
+    /// I/O failures require closing and reopening the database. `CommitUncertain`
+    /// means meta may have reached disk. `CommittedMappingFailed` means the commit
+    /// completed but mapping recovery failed; commit handlers still ran. Neither
+    /// error should be interpreted as a successful rollback.
     pub fn commit(&self) -> Result<()> {
         self.inner.borrow_mut().commit()
     }
@@ -198,7 +203,8 @@ impl Tx {
         self.inner.borrow().meta.clone()
     }
 
-    /// Register a handler to run after a successful commit (upstream `Tx.OnCommit`).
+    /// Register a handler after meta commit (upstream `Tx.OnCommit`).
+    /// Also runs when the committed transaction returns `CommittedMappingFailed`.
     pub fn on_commit<F>(&self, f: F)
     where
         F: FnOnce() + 'static,
@@ -236,7 +242,7 @@ fn inspect_bucket(tx: &Tx, _name: &[u8]) -> BucketStructure {
     };
     while let Some(k) = kv.0.clone() {
         if kv.1.is_none() {
-            if let Some(child) = tx.bucket(&k) {
+            if let Ok(Some(child)) = tx.bucket(&k) {
                 bs.children.push(inspect_named(&child, &k));
             }
         } else {
@@ -263,7 +269,7 @@ fn inspect_named(b: &Bucket, name: &[u8]) -> BucketStructure {
     };
     while let Some(k) = kv.0.clone() {
         if kv.1.is_none() {
-            if let Some(child) = b.bucket(&k) {
+            if let Ok(Some(child)) = b.bucket(&k) {
                 bs.children.push(inspect_named(&child, &k));
             }
         } else {

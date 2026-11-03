@@ -1,3 +1,5 @@
+#![cfg(feature = "cli")]
+
 //! CLI smoke tests corresponding to upstream `cmd/bbolt/command/*_test.go` basics.
 
 use std::process::Command;

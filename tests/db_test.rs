@@ -72,7 +72,7 @@ fn test_open_read_only() {
     assert!(db.is_read_only());
     db.view(|tx| {
         assert_eq!(
-            tx.bucket(b"widgets").unwrap().get(b"foo").as_deref(),
+            tx.bucket(b"widgets").unwrap().unwrap().get(b"foo").unwrap().as_deref(),
             Some(&b"bar"[..])
         );
         Ok(())
@@ -127,7 +127,7 @@ fn test_open_recover_free_list() {
         let tx = db.begin(true).unwrap();
         for i in 0..50 {
             let s = format!("{i}");
-            tx.bucket(s.as_bytes()).unwrap().delete(s.as_bytes()).unwrap();
+            tx.bucket(s.as_bytes()).unwrap().unwrap().delete(s.as_bytes()).unwrap();
         }
         tx.commit().unwrap();
         db.close().unwrap();
@@ -186,9 +186,9 @@ fn test_db_update() {
     })
     .unwrap();
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
-        assert!(b.get(b"foo").is_none());
-        assert_eq!(b.get(b"baz").as_deref(), Some(&b"bat"[..]));
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
+        assert!(b.get(b"foo").unwrap().is_none());
+        assert_eq!(b.get(b"baz").unwrap().as_deref(), Some(&b"bat"[..]));
         Ok(())
     })
     .unwrap();
@@ -206,7 +206,7 @@ fn test_db_update_manual_commit() {
     tx.commit().unwrap();
     db.view(|tx| {
         assert_eq!(
-            tx.bucket(b"widgets").unwrap().get(b"foo").as_deref(),
+            tx.bucket(b"widgets").unwrap().unwrap().get(b"foo").unwrap().as_deref(),
             Some(&b"bar"[..])
         );
         Ok(())
@@ -222,7 +222,7 @@ fn test_db_update_manual_rollback() {
     tx.create_bucket(b"widgets").unwrap().put(b"foo", b"bar").unwrap();
     tx.rollback().unwrap();
     db.view(|tx| {
-        assert!(tx.bucket(b"widgets").is_none());
+        assert!(tx.bucket(b"widgets").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -239,7 +239,7 @@ fn test_db_view_manual_commit() {
     .unwrap();
     let tx = db.begin(false).unwrap();
     assert_eq!(
-        tx.bucket(b"widgets").unwrap().get(b"foo").as_deref(),
+        tx.bucket(b"widgets").unwrap().unwrap().get(b"foo").unwrap().as_deref(),
         Some(&b"bar"[..])
     );
     assert!(matches!(tx.commit(), Err(Error::TxNotWritable)));
@@ -257,7 +257,7 @@ fn test_db_view_manual_rollback() {
     .unwrap();
     let tx = db.begin(false).unwrap();
     assert_eq!(
-        tx.bucket(b"widgets").unwrap().get(b"foo").as_deref(),
+        tx.bucket(b"widgets").unwrap().unwrap().get(b"foo").unwrap().as_deref(),
         Some(&b"bar"[..])
     );
     tx.rollback().unwrap();
@@ -295,7 +295,7 @@ fn test_db_consistency() {
     .unwrap();
     for _ in 0..10 {
         db.update(|tx| {
-            tx.bucket(b"widgets").unwrap().put(b"foo", b"bar")?;
+            tx.bucket(b"widgets").unwrap().unwrap().put(b"foo", b"bar")?;
             Ok(())
         })
         .unwrap();
@@ -339,7 +339,7 @@ fn test_db_batch() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             db.batch(move |tx| {
-                tx.bucket(b"widgets")
+                tx.bucket(b"widgets").unwrap()
                     .unwrap()
                     .put(&i.to_le_bytes(), b"")?;
                 Ok(())
@@ -350,9 +350,9 @@ fn test_db_batch() {
         h.join().unwrap().unwrap();
     }
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 0..2u64 {
-            assert!(b.get(&i.to_le_bytes()).is_some());
+            assert!(b.get(&i.to_le_bytes()).unwrap().is_some());
         }
         Ok(())
     })
@@ -435,7 +435,7 @@ fn test_db_max_size_not_exceeded() {
     let sz_before = common::file_size(&path);
     assert!(sz_before <= max_size as u64);
     let err = db.update(|tx| {
-        tx.bucket(b"data")
+        tx.bucket(b"data").unwrap()
             .unwrap()
             .put(b"oversized", &vec![0u8; 400_000])?;
         Ok(())
@@ -466,7 +466,7 @@ fn test_db_huge_value() {
     })
     .unwrap();
     db.view(|tx| {
-        let got = tx.bucket(b"data").unwrap().get(b"key").unwrap();
+        let got = tx.bucket(b"data").unwrap().unwrap().get(b"key").unwrap().unwrap();
         assert_eq!(got.len(), size);
         Ok(())
     })
@@ -488,7 +488,7 @@ fn test_db_write_to_and_overwrite() {
     .unwrap();
     let mut expected = std::collections::HashMap::new();
     db.view(|tx| {
-        let b = tx.bucket(b"data").unwrap();
+        let b = tx.bucket(b"data").unwrap().unwrap();
         b.for_each(|k, v| {
             expected.insert(k.to_vec(), v.unwrap().to_vec());
             Ok(())
@@ -514,7 +514,7 @@ fn test_db_write_to_and_overwrite() {
     )
     .unwrap();
     snap.view(|tx| {
-        let b = tx.bucket(b"data").unwrap();
+        let b = tx.bucket(b"data").unwrap().unwrap();
         b.for_each(|k, v| {
             assert_eq!(expected.get(k), Some(&v.unwrap().to_vec()));
             Ok(())
@@ -631,7 +631,7 @@ fn test_open_size() {
     assert!(sz > 0);
     let db = common::reopen(&dir, None);
     db.update(|tx| {
-        tx.bucket(b"data").unwrap().put(b"\0", b"\0")?;
+        tx.bucket(b"data").unwrap().unwrap().put(b"\0", b"\0")?;
         Ok(())
     })
     .unwrap();
@@ -693,7 +693,7 @@ fn test_db_concurrent_write_to_and_consistent_read() {
 
     for round in 0..wtxs {
         let tx = db.begin(true).unwrap();
-        let b = tx.bucket(b"data").unwrap();
+        let b = tx.bucket(b"data").unwrap().unwrap();
         let mut round_snapshots = Vec::new();
         for _j in 0..rtxs {
             let rtx = db.begin(false).unwrap();
@@ -701,7 +701,7 @@ fn test_db_concurrent_write_to_and_consistent_read() {
             let backup = tempfile::NamedTempFile::new().unwrap();
             rtx.copy_file(backup.path(), 0o600).unwrap();
             let mut data = HashMap::new();
-            rtx.bucket(b"data").unwrap().for_each(|k, v| {
+            rtx.bucket(b"data").unwrap().unwrap().for_each(|k, v| {
                 data.insert(
                     String::from_utf8_lossy(k).into_owned(),
                     String::from_utf8_lossy(v.unwrap()).into_owned(),
@@ -761,7 +761,7 @@ fn test_db_batch_full() {
         let tx_ch = tx_ch.clone();
         thread::spawn(move || {
             let r = db.batch(move |tx| {
-                tx.bucket(b"widgets")
+                tx.bucket(b"widgets").unwrap()
                     .unwrap()
                     .put(&i.to_le_bytes(), b"")?;
                 Ok(())
@@ -778,9 +778,9 @@ fn test_db_batch_full() {
         rx.recv().unwrap().unwrap();
     }
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         for i in 1..=SIZE as u64 {
-            assert!(b.get(&i.to_le_bytes()).is_some());
+            assert!(b.get(&i.to_le_bytes()).unwrap().is_some());
         }
         Ok(())
     })
@@ -836,7 +836,7 @@ fn test_db_update_panic() {
     .unwrap();
 
     db.update(|tx| {
-        assert!(tx.bucket(b"widgets").is_some());
+        assert!(tx.bucket(b"widgets").unwrap().is_some());
         Ok(())
     })
     .unwrap();
@@ -854,14 +854,14 @@ fn test_db_view_panic() {
 
     let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _: bbolt::Result<()> = db.view(|tx| {
-            assert!(tx.bucket(b"widgets").is_some());
+            assert!(tx.bucket(b"widgets").unwrap().is_some());
             panic!("omg");
         });
     }));
     assert!(recovered.is_err());
 
     db.view(|tx| {
-        assert!(tx.bucket(b"widgets").is_some());
+        assert!(tx.bucket(b"widgets").unwrap().is_some());
         Ok(())
     })
     .unwrap();
@@ -1041,7 +1041,7 @@ fn test_db_batch_time() {
     let db2 = db.clone();
     let handle = std::thread::spawn(move || {
         db2.batch(|tx| {
-            tx.bucket(b"widgets")
+            tx.bucket(b"widgets").unwrap()
                 .unwrap()
                 .put(&1u64.to_be_bytes(), &[])?;
             Ok(())
@@ -1050,9 +1050,9 @@ fn test_db_batch_time() {
     handle.join().unwrap().unwrap();
     db.view(|tx| {
         assert!(tx
-            .bucket(b"widgets")
+            .bucket(b"widgets").unwrap()
             .unwrap()
-            .get(&1u64.to_be_bytes())
+            .get(&1u64.to_be_bytes()).unwrap()
             .is_some());
         Ok(())
     })

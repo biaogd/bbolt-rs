@@ -102,7 +102,7 @@ fn test_tx_bucket() {
     let (_dir, db) = common::open_tmp();
     db.update(|tx| {
         tx.create_bucket(b"widgets")?;
-        assert!(tx.bucket(b"widgets").is_some());
+        assert!(tx.bucket(b"widgets").unwrap().is_some());
         Ok(())
     })
     .unwrap();
@@ -118,7 +118,7 @@ fn test_tx_create_bucket() {
     })
     .unwrap();
     db.view(|tx| {
-        assert!(tx.bucket(b"widgets").is_some());
+        assert!(tx.bucket(b"widgets").unwrap().is_some());
         Ok(())
     })
     .unwrap();
@@ -135,7 +135,7 @@ fn test_tx_create_bucket_if_not_exists() {
     })
     .unwrap();
     db.view(|tx| {
-        assert!(tx.bucket(b"widgets").is_some());
+        assert!(tx.bucket(b"widgets").unwrap().is_some());
         Ok(())
     })
     .unwrap();
@@ -199,12 +199,12 @@ fn test_tx_delete_bucket() {
     .unwrap();
     db.update(|tx| {
         tx.delete_bucket(b"widgets")?;
-        assert!(tx.bucket(b"widgets").is_none());
+        assert!(tx.bucket(b"widgets").unwrap().is_none());
         Ok(())
     })
     .unwrap();
     db.update(|tx| {
-        assert!(tx.create_bucket(b"widgets")?.get(b"foo").is_none());
+        assert!(tx.create_bucket(b"widgets")?.get(b"foo").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -283,9 +283,9 @@ fn test_tx_copy_file() {
     .unwrap();
     let db2 = common::reopen_path(&copy_path, None);
     db2.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
-        assert_eq!(b.get(b"foo").as_deref(), Some(&b"bar"[..]));
-        assert_eq!(b.get(b"baz").as_deref(), Some(&b"bat"[..]));
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
+        assert_eq!(b.get(b"foo").unwrap().as_deref(), Some(&b"bar"[..]));
+        assert_eq!(b.get(b"baz").unwrap().as_deref(), Some(&b"bat"[..]));
         Ok(())
     })
     .unwrap();
@@ -301,10 +301,10 @@ fn test_tx_rollback() {
     })
     .unwrap();
     let tx = db.begin(true).unwrap();
-    tx.bucket(b"mybucket").unwrap().put(b"k", b"v").unwrap();
+    tx.bucket(b"mybucket").unwrap().unwrap().put(b"k", b"v").unwrap();
     tx.rollback().unwrap();
     db.view(|tx| {
-        assert!(tx.bucket(b"mybucket").unwrap().get(b"k").is_none());
+        assert!(tx.bucket(b"mybucket").unwrap().unwrap().get(b"k").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -349,7 +349,7 @@ fn test_tx_get_not_found() {
     db.update(|tx| {
         let b = tx.create_bucket(b"widgets")?;
         b.put(b"foo", b"bar")?;
-        assert!(b.get(b"no_such_key").is_none());
+        assert!(b.get(b"no_such_key").unwrap().is_none());
         Ok(())
     })
     .unwrap();
@@ -566,13 +566,13 @@ fn test_tx_release_range() {
     };
     let del = |db: &bbolt::Db, key: &[u8]| {
         db.update(|tx| {
-            tx.bucket(bucket).unwrap().delete(key)?;
+            tx.bucket(bucket).unwrap().unwrap().delete(key)?;
             Ok(())
         })
         .unwrap();
     };
     let get = |tx: &bbolt::Tx, key: &[u8]| -> Option<Vec<u8>> {
-        tx.bucket(bucket).unwrap().get(key).map(|v| v.to_vec())
+        tx.bucket(bucket).unwrap().unwrap().get(key).unwrap().map(|v| v.to_vec())
     };
 
     put(&db, b"k1", b"v1");

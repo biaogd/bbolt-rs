@@ -5,7 +5,7 @@ mod common;
 use bbolt::{CheckOptions, PageHeader, branch_at, leaf_at, PAGE_HEADER_SIZE, LEAF_PAGE_ELEMENT_SIZE};
 
 fn must_bucket_root(db: &bbolt::Db, bucket: &[u8]) -> u64 {
-    db.view(|tx| Ok(tx.bucket(bucket).unwrap().root()))
+    db.view(|tx| Ok(tx.bucket(bucket).unwrap().unwrap().root()))
         .unwrap()
 }
 
@@ -15,7 +15,7 @@ fn leaf_pages_under_root(file: &[u8], root: u64, page_size: usize) -> Vec<u64> {
     let hdr = PageHeader::read(page);
     if hdr.is_branch() {
         (0..hdr.count as usize)
-            .map(|i| branch_at(page, i).0)
+            .map(|i| branch_at(page, i).unwrap().0)
             .collect()
     } else {
         vec![root]
@@ -28,7 +28,7 @@ fn corrupt_leaf_key_order(path: &std::path::Path, victim: u64, page_size: usize)
     let page = &mut file[off..off + page_size];
     let hdr = PageHeader::read(page);
     assert!(hdr.count > 1, "need multi-element leaf");
-    let (_, _key, _) = leaf_at(page, 1);
+    let (_, _key, _) = leaf_at(page, 1).unwrap();
     let elem_off = PAGE_HEADER_SIZE + LEAF_PAGE_ELEMENT_SIZE;
     let pos = u32::from_le_bytes(page[elem_off + 4..elem_off + 8].try_into().unwrap()) as usize;
     let key_off = off + elem_off + pos;

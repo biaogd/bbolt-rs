@@ -16,8 +16,8 @@ use crate::freelist::{Freelist, FreelistType};
 use crate::inner::TxInner;
 use crate::page::{
     branch_at, leaf_at, meta_from_page, write_meta_page, InBucket, Meta, PageHeader, Pgid, Txid,
-    DEFAULT_ALLOC_SIZE, DEFAULT_MAX_BATCH_DELAY_MS, DEFAULT_MAX_BATCH_SIZE, FREELIST_PAGE_FLAG,
-    LEAF_PAGE_FLAG, MAGIC, MAX_MMAP_STEP, META_SIZE, PAGE_HEADER_SIZE, BUCKET_LEAF_FLAG, VERSION,
+    BUCKET_LEAF_FLAG, DEFAULT_ALLOC_SIZE, DEFAULT_MAX_BATCH_DELAY_MS, DEFAULT_MAX_BATCH_SIZE,
+    FREELIST_PAGE_FLAG, LEAF_PAGE_FLAG, MAGIC, MAX_MMAP_STEP, META_SIZE, PAGE_HEADER_SIZE, VERSION,
 };
 use crate::platform;
 use crate::stats::{Info, Stats};
@@ -82,6 +82,10 @@ pub struct DbInner {
     pub freelist: Mutex<Freelist>,
     pub freelist_loaded: AtomicBool,
     pub opened: AtomicBool,
+    /// A failed commit requires reopening before any new transactions.
+    pub recovery_required: AtomicBool,
+    #[cfg(test)]
+    pub fault: Mutex<Option<crate::recovery_tests::Fault>>,
     pub batch: Mutex<crate::batch::BatchState>,
     pub stats: Mutex<Stats>,
     pub open_ro_tx: AtomicUsize,
@@ -97,29 +101,34 @@ impl DbInner {
     /// Clone the current mmap pin (cheap). Transactions keep this for zero-copy reads.
     pub fn pin_mmap(&self) -> Result<Arc<Mmap>> {
         let slot = self.mmap.read();
-        slot.mmap
-            .as_ref()
-            .cloned()
-            .ok_or(Error::InvalidMapping)
+        slot.mmap.as_ref().cloned().ok_or(Error::InvalidMapping)
     }
 
     /// Byte range for `pgid` within a pinned mmap (including overflow pages).
     pub fn page_bytes<'a>(mmap: &'a Mmap, page_size: usize, pgid: Pgid) -> Result<&'a [u8]> {
-        let start = pgid as usize * page_size;
-        if start + PAGE_HEADER_SIZE > mmap.len() {
+        let invalid = || Error::Corrupt("page range overflow".into());
+        let start = usize::try_from(pgid)
+            .ok()
+            .and_then(|id| id.checked_mul(page_size))
+            .ok_or_else(invalid)?;
+        if start.checked_add(PAGE_HEADER_SIZE).ok_or_else(invalid)? > mmap.len() {
             return Err(Error::Corrupt(format!(
                 "page {pgid} starts past mmap ({} bytes)",
                 mmap.len()
             )));
         }
         let hdr = PageHeader::read(&mmap[start..]);
-        let n = (hdr.overflow as usize + 1) * page_size;
-        if start + n > mmap.len() {
+        let n = (hdr.overflow as usize)
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(page_size))
+            .ok_or_else(invalid)?;
+        let end = start.checked_add(n).ok_or_else(invalid)?;
+        if end > mmap.len() {
             return Err(Error::Corrupt(format!(
                 "page {pgid} overflow extends past mmap"
             )));
         }
-        Ok(&mmap[start..start + n])
+        Ok(&mmap[start..end])
     }
 
     pub fn read_page(&self, pgid: Pgid) -> Result<Vec<u8>> {
@@ -185,9 +194,10 @@ impl DbInner {
             let fs = self.file_size()? as usize;
             need.max(fs)
         };
-        let mut slot = self.mmap.write();
-        slot.mmap = None;
+        #[cfg(test)]
+        self.inject(crate::recovery_tests::Stage::Remap, None)?;
         let mmap = platform::map_file(&self.file, &self.path, map_len, self.mmap_flags)?;
+        let mut slot = self.mmap.write();
         slot.datasz = mmap.len();
         slot.mmap = Some(Arc::new(mmap));
         Ok(())
@@ -243,7 +253,7 @@ impl DbInner {
             return Err(Error::MaxSizeReached);
         }
         if minsz > self.mmap.read().datasz {
-            let _ = self.ensure_mapped(self.file_size()? as usize);
+            self.ensure_mapped(self.file_size()? as usize)?;
         }
         *meta_pgid = id + count as Pgid;
         crate::page::set_page_id(&mut buf, id);
@@ -310,12 +320,12 @@ impl DbInner {
         }
         if hdr.is_branch() {
             for i in 0..hdr.count as usize {
-                let (child, _) = branch_at(&page, i);
+                let (child, _) = branch_at(&page, i)?;
                 self.mark_reachable(child, reachable)?;
             }
         } else if hdr.is_leaf() {
             for i in 0..hdr.count as usize {
-                let (flags, _k, v) = leaf_at(&page, i);
+                let (flags, _k, v) = leaf_at(&page, i)?;
                 if flags & BUCKET_LEAF_FLAG != 0 && v.len() >= 16 {
                     let ib = InBucket::read(v);
                     if ib.root != 0 {
@@ -462,7 +472,9 @@ impl Db {
         // Prefer at least the file size; InitialMmapSize may request a larger mapping.
         let map_len = {
             let fs = file.metadata().map_err(|e| Error::io(path, e))?.len() as usize;
-            let want = fs.max(opts.initial_mmap_size).max(map_hint.min(fs.max(page_size * 2)));
+            let want = fs
+                .max(opts.initial_mmap_size)
+                .max(map_hint.min(fs.max(page_size * 2)));
             #[cfg(unix)]
             {
                 // On Unix, mapping beyond EOF is not used; map the file size.
@@ -511,6 +523,9 @@ impl Db {
             freelist: Mutex::new(Freelist::new(opts.freelist_type)),
             freelist_loaded: AtomicBool::new(false),
             opened: AtomicBool::new(true),
+            recovery_required: AtomicBool::new(false),
+            #[cfg(test)]
+            fault: Mutex::new(None),
             batch: Mutex::new(crate::batch::BatchState::default()),
             stats: Mutex::new(Stats::default()),
             open_ro_tx: AtomicUsize::new(0),
@@ -578,6 +593,9 @@ impl Db {
 
     /// Start a transaction. Only one write transaction may be active at a time.
     pub fn begin(&self, writable: bool) -> Result<Tx> {
+        if self.inner.recovery_required.load(Ordering::SeqCst) {
+            return Err(Error::RecoveryRequired);
+        }
         if !self.inner.opened.load(Ordering::SeqCst) {
             return Err(Error::DatabaseNotOpen);
         }
@@ -591,6 +609,10 @@ impl Db {
             if !self.inner.opened.load(Ordering::SeqCst) {
                 self.inner.writer.unlock();
                 return Err(Error::DatabaseNotOpen);
+            }
+            if self.inner.recovery_required.load(Ordering::SeqCst) {
+                self.inner.writer.unlock();
+                return Err(Error::RecoveryRequired);
             }
             if self.inner.mmap.read().mmap.is_none() {
                 self.inner.writer.unlock();
@@ -607,6 +629,9 @@ impl Db {
             let _g = self.inner.metalock.lock();
             if !self.inner.opened.load(Ordering::SeqCst) {
                 return Err(Error::DatabaseNotOpen);
+            }
+            if self.inner.recovery_required.load(Ordering::SeqCst) {
+                return Err(Error::RecoveryRequired);
             }
             if self.inner.mmap.read().mmap.is_none() {
                 return Err(Error::InvalidMapping);
@@ -625,7 +650,8 @@ impl Db {
     }
 
     /// Run `f` inside a managed write transaction.
-    /// Returning `Ok` commits; `Err` rolls back.
+    /// A callback error rolls back; a successful callback attempts to commit.
+    /// Commit errors follow [`Tx::commit`] recovery semantics.
     pub fn update<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Tx) -> Result<T>,
@@ -668,7 +694,13 @@ impl Db {
         }
     }
 
-    /// Combine concurrent writers. The function must be idempotent; it may run more than once.
+    /// Combine concurrent writers. Callbacks may run again when another callback fails;
+    /// external side effects must tolerate retries. Calls within one attempt run in queue
+    /// order; concurrent batches and failed-call retries have no global ordering guarantee.
+    /// Queued groups flush at `max_batch_size` (minimum one); lowering this setting
+    /// flushes the existing group on the next enqueue. There is at
+    /// most one sleeping timer per database; caller threads and active groups are bounded
+    /// by caller concurrency. Zero delay drains only calls already queued, without a timer.
     pub fn batch<F>(&self, f: F) -> Result<()>
     where
         F: Fn(&Tx) -> Result<()> + Send + 'static,
@@ -678,9 +710,7 @@ impl Db {
 
     /// Set the maximum number of batch calls before a write transaction runs.
     pub fn set_max_batch_size(&self, size: usize) {
-        self.inner
-            .max_batch_size
-            .store(size, Ordering::Relaxed);
+        self.inner.max_batch_size.store(size, Ordering::Relaxed);
     }
 
     /// Set the maximum delay before a partial batch is flushed.

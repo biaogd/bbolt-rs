@@ -1,8 +1,12 @@
 //! Apples-to-apples workload harness matching `benches/go`.
 //!
 //! ```text
-//! cargo run --release --bin bench_compare -- -dir DIR -workload NAME -n N
+//! cargo run --release --features cli --bin bench_compare -- -dir DIR -workload NAME -n N
 //! ```
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -199,11 +203,11 @@ fn timed_random_get(
     let mut key = vec![0u8; key_size];
     let start = Instant::now();
     db.view(|tx| {
-        let b = tx.bucket(b"bench").ok_or(bbolt::Error::BucketNotFound)?;
+        let b = tx.bucket(b"bench")?.ok_or(bbolt::Error::BucketNotFound)?;
         for &i in &order {
             make_key(&mut key, i);
             // Match Go `b.Get(key) == nil` (zero-copy existence; no value heap alloc).
-            if !b.has_value(&key) {
+            if !b.has_value(&key)? {
                 return Err(bbolt::Error::Invalid);
             }
         }
@@ -220,7 +224,7 @@ fn timed_cursor_scan(path: &Path, opts: &Options) -> Result<(usize, u128), Strin
     let mut count = 0usize;
     let start = Instant::now();
     db.view(|tx| {
-        let b = tx.bucket(b"bench").ok_or(bbolt::Error::BucketNotFound)?;
+        let b = tx.bucket(b"bench")?.ok_or(bbolt::Error::BucketNotFound)?;
         let mut c = b.cursor();
         // Match Go harness: `for k, _ := c.First(); k != nil; k, _ = c.Next()`
         let mut ok = c.first_view()?;
@@ -249,7 +253,7 @@ fn timed_deletes(
     let mut key = vec![0u8; key_size];
     let start = Instant::now();
     db.update(|tx| {
-        let b = tx.bucket(b"bench").ok_or(bbolt::Error::BucketNotFound)?;
+        let b = tx.bucket(b"bench")?.ok_or(bbolt::Error::BucketNotFound)?;
         for i in 0..del_n {
             make_key(&mut key, i);
             b.delete(&key)?;

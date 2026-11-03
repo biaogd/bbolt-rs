@@ -6,3 +6,6 @@
 !tests/fixtures/*.db
 /bench-data/
 /bench-data-smoke/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/

@@ -42,7 +42,7 @@ fn test_open_with_pre_load_freelist() {
     .unwrap();
     db.view(|tx| {
         assert_eq!(
-            tx.bucket(b"b").unwrap().get(b"k").as_deref(),
+            tx.bucket(b"b").unwrap().unwrap().get(b"k").unwrap().as_deref(),
             Some(&b"v"[..])
         );
         Ok(())

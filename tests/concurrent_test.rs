@@ -23,12 +23,12 @@ fn test_concurrent_repeatable_read() {
     let db_r = Arc::clone(&db);
     let reader = thread::spawn(move || {
         db_r.view(|tx| {
-            let b = tx.bucket(b"widgets").unwrap();
-            assert_eq!(b.get(b"foo").as_deref(), Some(&b"bar"[..]));
+            let b = tx.bucket(b"widgets").unwrap().unwrap();
+            assert_eq!(b.get(b"foo").unwrap().as_deref(), Some(&b"bar"[..]));
             // Hold the read tx open while writer runs (caller joins after writer start).
             thread::sleep(std::time::Duration::from_millis(50));
-            assert_eq!(b.get(b"foo").as_deref(), Some(&b"bar"[..]));
-            assert!(b.get(b"new").is_none());
+            assert_eq!(b.get(b"foo").unwrap().as_deref(), Some(&b"bar"[..]));
+            assert!(b.get(b"new").unwrap().is_none());
             Ok(())
         })
         .unwrap();
@@ -36,7 +36,7 @@ fn test_concurrent_repeatable_read() {
 
     thread::sleep(std::time::Duration::from_millis(10));
     db.update(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
         b.put(b"new", b"val")?;
         b.put(b"foo", b"baz")?;
         Ok(())
@@ -46,9 +46,9 @@ fn test_concurrent_repeatable_read() {
     reader.join().unwrap();
 
     db.view(|tx| {
-        let b = tx.bucket(b"widgets").unwrap();
-        assert_eq!(b.get(b"foo").as_deref(), Some(&b"baz"[..]));
-        assert_eq!(b.get(b"new").as_deref(), Some(&b"val"[..]));
+        let b = tx.bucket(b"widgets").unwrap().unwrap();
+        assert_eq!(b.get(b"foo").unwrap().as_deref(), Some(&b"baz"[..]));
+        assert_eq!(b.get(b"new").unwrap().as_deref(), Some(&b"val"[..]));
         Ok(())
     })
     .unwrap();
@@ -76,7 +76,7 @@ fn test_concurrent_generic_read_and_write() {
             for n in 0..50u8 {
                 if n % 5 == 0 {
                     db.update(|tx| {
-                        let b = tx.bucket(b"data").unwrap();
+                        let b = tx.bucket(b"data").unwrap().unwrap();
                         let key = [i, n];
                         b.put(&key, &key)?;
                         Ok(())
@@ -84,8 +84,8 @@ fn test_concurrent_generic_read_and_write() {
                     .unwrap();
                 } else {
                     db.view(|tx| {
-                        let b = tx.bucket(b"data").unwrap();
-                        let _ = b.get(&[i, n.saturating_sub(1)]);
+                        let b = tx.bucket(b"data").unwrap().unwrap();
+                        let _ = b.get(&[i, n.saturating_sub(1)]).unwrap();
                         Ok(())
                     })
                     .unwrap();

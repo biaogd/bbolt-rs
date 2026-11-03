@@ -72,24 +72,24 @@ fn simulate_get(tx: &bbolt::Tx, qdb: &QuickDb) {
     let Some(keys) = qdb.rand_keys() else {
         return;
     };
-    let mut b = tx.bucket(&keys[0]).expect("root bucket");
+    let mut b = tx.bucket(&keys[0]).unwrap().expect("root bucket");
     for key in &keys[1..keys.len() - 1] {
-        b = b.bucket(key).expect("nested bucket");
+        b = b.bucket(key).unwrap().expect("nested bucket");
     }
     let expected = qdb.get(&keys).unwrap();
-    let actual = b.get(&keys[keys.len() - 1]);
+    let actual = b.get(&keys[keys.len() - 1]).unwrap();
     assert_eq!(actual.as_deref(), Some(expected));
 }
 
 fn simulate_put(tx: &bbolt::Tx, qdb: &mut QuickDb) {
     let keys = rand_keys();
     let value = rand_value();
-    let mut b = match tx.bucket(&keys[0]) {
+    let mut b = match tx.bucket(&keys[0]).unwrap() {
         Some(b) => b,
         None => tx.create_bucket(&keys[0]).unwrap(),
     };
     for key in &keys[1..keys.len() - 1] {
-        b = match b.bucket(key) {
+        b = match b.bucket(key).unwrap() {
             Some(nb) => nb,
             None => b.create_bucket(key).unwrap(),
         };

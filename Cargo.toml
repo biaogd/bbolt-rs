@@ -9,15 +9,20 @@ readme = "README.md"
 keywords = ["database", "embedded", "bbolt", "bolt", "key-value"]
 categories = ["database-implementations"]
 
+[features]
+default = []
+cli = ["dep:clap"]
+jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
 libc = "0.2"
 memmap2 = "0.9"
 parking_lot = "0.12"
 thiserror = "2"
-clap = { version = "=4.5.23", features = ["derive"] }
+clap = { version = "=4.5.23", features = ["derive"], optional = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -38,6 +43,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "bbolt"
 path = "src/bin/bbolt.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "bench_compare"
+path = "src/bin/bench_compare.rs"
+required-features = ["cli"]
 
 [profile.release]
 lto = true

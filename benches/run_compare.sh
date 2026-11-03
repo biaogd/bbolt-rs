@@ -18,7 +18,7 @@ df -T "${DATA_ROOT}" | tee "${DATA_ROOT}/disk.txt"
 
 echo "Building harnesses..."
 (cd "${ROOT}/benches/go" && go build -o go-bench .)
-(cd "${ROOT}" && cargo build --release --bin bench_compare)
+(cd "${ROOT}" && cargo build --release --features cli,jemalloc --bin bench_compare)
 
 run_one() {
   local impl="$1" workload="$2" dir="$3"

@@ -20,7 +20,7 @@ fn open_chain(tx: &Tx, path: &[&[u8]]) -> Option<Bucket> {
     if path.is_empty() {
         return None;
     }
-    let mut b = if let Some(existing) = tx.bucket(path[0]) {
+    let mut b = if let Some(existing) = tx.bucket(path[0]).unwrap() {
         existing
     } else {
         let created = tx.create_bucket(path[0]).unwrap();
@@ -28,7 +28,7 @@ fn open_chain(tx: &Tx, path: &[&[u8]]) -> Option<Bucket> {
         created
     };
     for &name in &path[1..] {
-        b = if let Some(child) = b.bucket(name) {
+        b = if let Some(child) = b.bucket(name).unwrap() {
             child
         } else {
             let child = b.create_bucket(name).unwrap();
@@ -69,20 +69,20 @@ fn create_named_bucket(parent: Option<&Bucket>, tx: &Tx, name: &[u8]) -> Bucket 
 
 fn moved_bucket(tx: &Tx, dst_path: &[&[u8]], name: &[u8]) -> Bucket {
     if dst_path.is_empty() {
-        tx.bucket(name).unwrap()
+        tx.bucket(name).unwrap().unwrap()
     } else {
         open_chain(tx, dst_path)
             .unwrap()
-            .bucket(name)
+            .bucket(name).unwrap()
             .unwrap()
     }
 }
 
 fn source_bucket(tx: &Tx, src_path: &[&[u8]], name: &[u8]) -> Bucket {
     if src_path.is_empty() {
-        tx.bucket(name).unwrap()
+        tx.bucket(name).unwrap().unwrap()
     } else {
-        open_chain(tx, src_path).unwrap().bucket(name).unwrap()
+        open_chain(tx, src_path).unwrap().bucket(name).unwrap().unwrap()
     }
 }
 

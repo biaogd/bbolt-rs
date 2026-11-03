@@ -44,13 +44,12 @@ impl Bucket {
         Cursor::new(Rc::clone(&self.tx), self.id)
     }
 
-    pub fn bucket(&self, name: &[u8]) -> Option<Bucket> {
+    /// Open a nested bucket. Missing names return `Ok(None)`; read failures propagate.
+    pub fn bucket(&self, name: &[u8]) -> Result<Option<Bucket>> {
         let mut inner = self.tx.borrow_mut();
-        inner
-            .bucket_by_name(self.id, name)
-            .ok()
-            .flatten()
-            .map(|id| Bucket::new(Rc::clone(&self.tx), id))
+        Ok(inner
+            .bucket_by_name(self.id, name)?
+            .map(|id| Bucket::new(Rc::clone(&self.tx), id)))
     }
 
     pub fn create_bucket(&self, name: &[u8]) -> Result<Bucket> {
@@ -69,17 +68,16 @@ impl Bucket {
         self.tx.borrow_mut().delete_bucket(self.id, name)
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.tx.borrow_mut().get(self.id, key).ok().flatten()
+    /// Read a value. Missing keys and nested bucket keys return `Ok(None)`.
+    /// Closed transactions and corrupt storage return an error.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.tx.borrow_mut().get(self.id, key)
     }
 
     /// Zero-copy existence check equivalent to Go `Bucket.Get(key) != nil` for values
     /// (no heap allocation of the value bytes).
-    pub fn has_value(&self, key: &[u8]) -> bool {
-        self.tx
-            .borrow()
-            .has_value(self.id, key)
-            .unwrap_or(false)
+    pub fn has_value(&self, key: &[u8]) -> Result<bool> {
+        self.tx.borrow().has_value(self.id, key)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
