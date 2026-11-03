@@ -1175,7 +1175,10 @@ impl TxInner {
         if value.len() > MAX_VALUE_SIZE {
             return Err(Error::ValueTooLarge);
         }
-        // Fast path: sequential appends stay on the same leaf (bulk loads).
+        // A root leaf owns the entire key range, so sequential bulk appends
+        // may reuse it. A non-root leaf's last key does not bound the range of
+        // its right sibling: intervening Gets may skip existing keys without
+        // updating this hint. Such writes must seek through the branch pages.
         if let Some((hbid, nid)) = self.put_hint {
             if hbid == bid {
                 let can_append = self
@@ -1183,7 +1186,9 @@ impl TxInner {
                     .get(&bid)
                     .and_then(|b| b.nodes.get(&nid))
                     .is_some_and(|n| {
-                        n.is_leaf && n.inodes.back().is_none_or(|last| last.key.as_slice() < key)
+                        n.is_leaf
+                            && n.parent.is_none()
+                            && n.inodes.back().is_none_or(|last| last.key.as_slice() < key)
                     });
                 if can_append {
                     // Ensure we are not colliding with a nested bucket at `key`
